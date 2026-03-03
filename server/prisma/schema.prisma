@@ -50,6 +50,7 @@ model User {
 
   subjects Subject[]
   notes    Note[]
+  exams    Exam[]
 
   @@map("users")
 }
@@ -115,10 +116,12 @@ model StudySession {
 
 model Exam {
   id        String   @id @default(cuid())
+  userId    String   @map("user_id")
   title     String
   examDate  DateTime @map("exam_date") @db.Date
   createdAt DateTime @default(now()) @map("created_at")
 
+  user  User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   marks ExamMark[]
 
   @@map("exams")

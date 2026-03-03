@@ -129,7 +129,10 @@ export function SessionsPage() {
     const [dynamicQuiz, setDynamicQuiz] = useState<AIQuizQuestion[] | null>(null);
 
     async function handleAiFlashcards() {
-        if (!selectedSubject || !session) return;
+        // Bug 6 fix: this must only be called in the flashcards phase
+        // where reviewId is guaranteed to be set. session.id is a StudySession ID,
+        // not a ReviewItem ID — passing it to addFlashcard caused a 404.
+        if (!selectedSubject || !reviewId) return;
         setGenerating(true); setGenError(null);
         try {
             const list = await notesApi.list(selectedSubject, topic);
@@ -139,12 +142,10 @@ export function SessionsPage() {
                 return;
             }
             const suggested = await generateApi.flashcards(notesText);
-            // Add them to the session cards (up to 5)
+            // Add AI-suggested cards using the correct ReviewItem ID (reviewId)
             for (const s of suggested) {
                 if (cards.length >= 5) break;
-                // Add card to backend via reviewsApi
-                const card = await reviewsApi.addFlashcard(session.id, s.question, s.answer);
-                // Update local list
+                const card = await reviewsApi.addFlashcard(reviewId, s.question, s.answer);
                 setCards(prev => [...prev, {
                     id: card.card_id,
                     cardId: card.card_id,

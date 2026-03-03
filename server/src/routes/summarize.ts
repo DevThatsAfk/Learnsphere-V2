@@ -2,9 +2,11 @@ import { Router } from 'express';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { authenticateToken } from '../middleware/auth';
 import { asyncHandler, ApiError } from '../middleware/errorHandler';
+import { aiRateLimit } from '../middleware/aiRateLimit';
 
 const router = Router();
 router.use(authenticateToken);
+router.use(aiRateLimit); // Bug 2 fix: runs after auth, userId is set
 
 /**
  * POST /api/summarize

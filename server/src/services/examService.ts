@@ -4,6 +4,7 @@ import { ApiError } from '../middleware/errorHandler';
 interface CreateExamInput {
     title: string;
     examDate: string; // YYYY-MM-DD from client
+    userId: string;   // Bug 3 fix: exams are user-scoped
 }
 
 interface ExamMarkInput {
@@ -16,11 +17,12 @@ interface ExamMarkInput {
 // ─────────────────────────────────────────────────
 
 /**
- * Get all exams (global — not user-scoped per DATABASE_SCHEMA.md / API_CONTRACTS.md).
- * Ordered by exam_date ascending (upcoming first).
+ * Get all exams for the authenticated user.
+ * Bug 3 fix: was global (no userId filter) — now scoped per user.
  */
-export async function getExams() {
+export async function getExams(userId: string) {
     const exams = await prisma.exam.findMany({
+        where: { userId },
         orderBy: { examDate: 'asc' },
         select: { id: true, title: true, examDate: true },
     });
@@ -28,16 +30,15 @@ export async function getExams() {
     return exams.map((e: { id: string; title: string; examDate: Date }) => ({
         id: e.id,
         title: e.title,
-        exam_date: e.examDate.toISOString().split('T')[0], // YYYY-MM-DD per API contract
+        exam_date: e.examDate.toISOString().split('T')[0],
     }));
 }
 
 /**
- * Create an exam.
- * exam_date must be a valid date string (YYYY-MM-DD).
+ * Create an exam, scoped to the authenticated user.
  */
 export async function createExam(input: CreateExamInput) {
-    const { title, examDate } = input;
+    const { title, examDate, userId } = input;
 
     if (!title || title.trim().length === 0) {
         throw new ApiError(400, 'Exam title is required.', 'INVALID_TITLE');
@@ -50,6 +51,7 @@ export async function createExam(input: CreateExamInput) {
 
     const exam = await prisma.exam.create({
         data: {
+            userId,
             title: title.trim(),
             examDate: parsedDate,
         },
@@ -72,7 +74,8 @@ export async function createExam(input: CreateExamInput) {
  * Returns only marks for subjects that belong to the authenticated user.
  */
 export async function getMarksForExam(examId: string, userId: string) {
-    const exam = await prisma.exam.findUnique({ where: { id: examId } });
+    // Bug 3 fix: verify the exam belongs to this user
+    const exam = await prisma.exam.findFirst({ where: { id: examId, userId } });
     if (!exam) {
         throw new ApiError(404, 'Exam not found.', 'NOT_FOUND');
     }
@@ -105,7 +108,8 @@ export async function addMarksForExam(
     markInputs: ExamMarkInput[],
     userId: string
 ) {
-    const exam = await prisma.exam.findUnique({ where: { id: examId } });
+    // Bug 3 fix: verify the exam belongs to this user
+    const exam = await prisma.exam.findFirst({ where: { id: examId, userId } });
     if (!exam) {
         throw new ApiError(404, 'Exam not found.', 'NOT_FOUND');
     }

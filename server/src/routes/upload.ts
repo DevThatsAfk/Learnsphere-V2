@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { upload } from '../middleware/upload';
 import { asyncHandler, ApiError } from '../middleware/errorHandler';
+import { aiRateLimit } from '../middleware/aiRateLimit';
 import {
     generateFlashcardsFromFile,
     generateQuizFromFile,
@@ -9,6 +10,7 @@ import {
 
 const router = Router();
 router.use(authenticateToken);
+router.use(aiRateLimit); // Bug 2 fix: runs after auth, userId is set
 
 /**
  * POST /api/upload/generate

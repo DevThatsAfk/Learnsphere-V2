@@ -18,8 +18,9 @@ router.use(authenticateToken);
  */
 router.get(
     '/',
-    asyncHandler(async (_req, res) => {
-        const exams = await getExams();
+    asyncHandler(async (req: AuthenticatedRequest, res) => {
+        const userId = req.userId!;
+        const exams = await getExams(userId);
         res.json(exams);
     })
 );
@@ -32,9 +33,10 @@ router.get(
 router.post(
     '/',
     asyncHandler(async (req: AuthenticatedRequest, res) => {
+        const userId = req.userId!;
         const { title, exam_date } = req.body as { title: string; exam_date: string };
         if (!exam_date) throw new ApiError(400, 'exam_date is required.', 'MISSING_DATE');
-        const exam = await createExam({ title, examDate: exam_date });
+        const exam = await createExam({ title, examDate: exam_date, userId });
         res.status(201).json(exam);
     })
 );

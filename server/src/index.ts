@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import rateLimit from 'express-rate-limit';
 import { errorHandler } from './middleware/errorHandler';
 
 // Route imports
@@ -38,23 +37,10 @@ app.get('/health', (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────
-// RATE LIMITING — AI routes (10 req / 15 min / user)
+// RATE LIMITING — exported and applied INSIDE each AI router
+// so it runs AFTER authenticateToken (userId is set by then)
 // ─────────────────────────────────────────────────
-const aiRateLimit = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 10,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many AI requests. Please wait 15 minutes before trying again.' },
-    keyGenerator: (req) => {
-        return (req as { userId?: string }).userId ?? req.ip ?? 'unknown';
-    },
-});
-
-// Apply rate limits BEFORE route registration
-app.use('/api/generate', aiRateLimit);
-app.use('/api/summarize', aiRateLimit);
-app.use('/api/upload', aiRateLimit);
+// (Rate limiter moved to middleware/aiRateLimit.ts)
 
 // ─────────────────────────────────────────────────
 // API ROUTES (mounted at /api)

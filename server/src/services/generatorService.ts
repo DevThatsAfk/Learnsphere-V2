@@ -4,11 +4,12 @@
  * Rules:
  *  - GROUNDING: Flashcards MUST be generated only from the provided context (notes).
  *  - No external knowledge or hallucinations.
- *  - Output format: Strict JSON schemas.
+ *  - Output validated via Zod schemas before returning.
  *  - Stateless: No data persisted by AI.
  */
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { ApiError } from '../middleware/errorHandler';
+import { FlashcardsResponseSchema, QuizResponseSchema } from '../schemas/aiSchemas';
 
 const MODEL_NAME = 'gemini-1.5-flash';
 
@@ -26,31 +27,36 @@ export async function generateFlashcardsFromNotes(noteContent: string) {
     });
 
     const prompt = `
-        You are an academic flashcard generator. Your task is to extract exactly 5 high-quality flashcards from the text provided.
-        
+        You are an academic flashcard generator. Extract exactly 5 high-quality flashcards from the text.
+
         STRICT RULES:
-        1. GROUNDING: Base the questions and answers ONLY on the provided text. Do not add outside information.
-        2. STRUCTURE: Return a JSON array of objects. Each object must have "question" and "answer" fields.
-        3. NO ESSAYS: Keep questions and answers concise (maximum 1 sentence each).
-        4. Focus on key definitions, dates, concepts, or formulas present in the text.
-        
+        1. Use ONLY information from the provided text — no outside knowledge.
+        2. Return a JSON object with a "flashcards" array.
+        3. Each flashcard must have "question" and "answer" string fields.
+        4. Keep answers concise (1 sentence max).
+
         TEXT CONTENT:
         """
         ${noteContent}
         """
-        
-        REQUIRED JSON SCHEMA:
-        [{ "question": "string", "answer": "string" }]
+
+        REQUIRED JSON FORMAT:
+        { "flashcards": [{ "question": "string", "answer": "string" }] }
     `;
 
     try {
         const result = await model.generateContent(prompt);
-        const text = result.response.text();
-        const cards = JSON.parse(text);
+        const raw = JSON.parse(result.response.text());
 
-        if (!Array.isArray(cards)) throw new Error('Invalid AI response structure.');
-        return cards.slice(0, 5); // Return exactly 5
+        // Bug 5 fix: Zod validation — reject malformed AI output
+        const validated = FlashcardsResponseSchema.safeParse(raw);
+        if (!validated.success) {
+            console.error('[AI_VALIDATION]', validated.error.message);
+            throw new ApiError(500, 'AI returned invalid flashcard structure. Please try again.', 'AI_VALIDATION_ERROR');
+        }
+        return validated.data.flashcards.slice(0, 5);
     } catch (error) {
+        if (error instanceof ApiError) throw error;
         console.error('[AI_GEN_ERROR]', error);
         throw new ApiError(500, 'Failed to generate flashcards from notes.', 'GENERATION_FAILED');
     }
@@ -67,30 +73,39 @@ export async function generateQuizFromNotes(noteContent: string) {
         generationConfig: { responseMimeType: 'application/json' },
     });
 
+    // Bug 1 fix: correctAnswer is now a 0-based NUMBER index, not a "correct": string
     const prompt = `
-        You are an academic quiz generator. Your task is to extract exactly 3 multiple-choice questions from the text provided.
-        
+        You are an academic quiz generator. Extract exactly 3 multiple-choice questions from the text.
+
         STRICT RULES:
-        1. GROUNDING: Base the questions and options ONLY on the provided text.
-        2. STRUCTURE: Return a JSON array of objects.
-        3. Options: Each question must have exactly 4 options.
-        
+        1. Use ONLY information from the provided text — no outside knowledge.
+        2. Return a JSON object with a "questions" array.
+        3. Each question must have exactly 4 options in the "options" array.
+        4. "correctAnswer" is the 0-based INDEX (0, 1, 2, or 3) of the correct option.
+        5. Include a brief "explanation" referencing the source text.
+
         TEXT CONTENT:
         """
         ${noteContent}
         """
-        
-        REQUIRED JSON SCHEMA:
-        [{ "id": "number", "question": "string", "options": ["string", "string", "string", "string"], "correct": "string" }]
+
+        REQUIRED JSON FORMAT:
+        { "questions": [{ "question": "string", "options": ["A","B","C","D"], "correctAnswer": 0, "explanation": "string" }] }
     `;
 
     try {
         const result = await model.generateContent(prompt);
-        const text = result.response.text();
-        const quiz = JSON.parse(text);
-        if (!Array.isArray(quiz)) throw new Error('Invalid AI response structure.');
-        return quiz.slice(0, 3);
+        const raw = JSON.parse(result.response.text());
+
+        // Bug 1+5 fix: Zod validates correctAnswer is a number in range 0-3
+        const validated = QuizResponseSchema.safeParse(raw);
+        if (!validated.success) {
+            console.error('[AI_VALIDATION]', validated.error.message);
+            throw new ApiError(500, 'AI returned invalid quiz structure. Please try again.', 'AI_VALIDATION_ERROR');
+        }
+        return validated.data.questions.slice(0, 3);
     } catch (error) {
+        if (error instanceof ApiError) throw error;
         console.error('[AI_GEN_ERROR]', error);
         throw new ApiError(500, 'Failed to generate quiz from notes.', 'GENERATION_FAILED');
     }

@@ -7,6 +7,7 @@
 import { Router } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { asyncHandler, ApiError } from '../middleware/errorHandler';
+import { aiRateLimit } from '../middleware/aiRateLimit';
 import {
     generateFlashcardsFromNotes,
     generateQuizFromNotes,
@@ -14,6 +15,7 @@ import {
 
 const router = Router();
 router.use(authenticateToken);
+router.use(aiRateLimit); // Bug 2 fix: runs AFTER auth, so req.userId is set
 
 router.post(
     '/flashcards',
