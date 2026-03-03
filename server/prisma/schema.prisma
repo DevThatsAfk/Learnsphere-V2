@@ -1,0 +1,193 @@
+// LearnSphere — Definitive Prisma Schema
+// Source of truth: DATABASE_SCHEMA.md (synchronized with API_CONTRACTS.md v1.0.0)
+// DO NOT edit manually — changes must go through migration
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────
+
+enum UserRole {
+  STUDENT
+  ADMIN
+}
+
+enum TaskStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum SessionType {
+  STUDY
+  REVISION
+}
+
+enum RecallStrength {
+  WEAK
+  MODERATE
+  STRONG
+}
+
+// ─────────────────────────────────────────────────
+// MODELS
+// ─────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         UserRole @default(STUDENT)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  subjects Subject[]
+  notes    Note[]
+
+  @@map("users")
+}
+
+model Subject {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks             Task[]
+  studySessions     StudySession[]
+  analyticsSnapshot AnalyticsSnapshot?
+  reviewItems       ReviewItem[]
+  examMarks         ExamMark[]
+  notes             Note[]
+
+  @@map("subjects")
+}
+
+model Task {
+  id                   String     @id @default(cuid())
+  subjectId            String     @map("subject_id")
+  title                String
+  status               TaskStatus @default(NOT_STARTED)
+  completionPercentage Int        @default(0) @map("completion_percentage")
+  createdAt            DateTime   @default(now()) @map("created_at")
+
+  subject   Subject         @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  checklist TaskChecklist[]
+
+  @@map("tasks")
+}
+
+model TaskChecklist {
+  id          String  @id @default(cuid())
+  taskId      String  @map("task_id")
+  label       String
+  isCompleted Boolean @default(false) @map("is_completed")
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@map("task_checklists")
+}
+
+model StudySession {
+  id             String      @id @default(cuid())
+  subjectId      String      @map("subject_id")
+  topic          String
+  sessionType    SessionType @default(STUDY) @map("session_type")
+  activeMinutes  Int         @default(0) @map("active_minutes")
+  startTime      DateTime    @default(now()) @map("start_time")
+  endTime        DateTime?   @map("end_time")
+  reflectionText String?     @map("reflection_text")
+  tags           String[]    @default([])
+  createdAt      DateTime    @default(now()) @map("created_at")
+
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@map("study_sessions")
+}
+
+model Exam {
+  id        String   @id @default(cuid())
+  title     String
+  examDate  DateTime @map("exam_date") @db.Date
+  createdAt DateTime @default(now()) @map("created_at")
+
+  marks ExamMark[]
+
+  @@map("exams")
+}
+
+model ExamMark {
+  id        String @id @default(cuid())
+  examId    String @map("exam_id")
+  subjectId String @map("subject_id")
+  marks     Int
+
+  exam    Exam    @relation(fields: [examId], references: [id], onDelete: Cascade)
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@unique([examId, subjectId])
+  @@map("exam_marks")
+}
+
+model AnalyticsSnapshot {
+  id                 String   @id @default(cuid())
+  subjectId          String   @unique @map("subject_id")
+  totalActiveMinutes Int      @default(0) @map("total_active_minutes")
+  averageMarks       Float?   @map("average_marks")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@map("analytics_snapshots")
+}
+
+model ReviewItem {
+  id             String         @id @default(cuid())
+  subjectId      String         @map("subject_id")
+  topic          String
+  recallStrength RecallStrength @default(WEAK) @map("recall_strength")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  subject    Subject     @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  flashcards Flashcard[]
+
+  @@map("review_items")
+}
+
+model Flashcard {
+  id           String @id @default(cuid())
+  reviewItemId String @map("review_item_id")
+  question     String
+  answer       String
+
+  reviewItem ReviewItem @relation(fields: [reviewItemId], references: [id], onDelete: Cascade)
+
+  @@map("flashcards")
+}
+
+// ─────────────────────────────────────────────────
+// STUDY NOTES (Feature 2 — user-authored, never AI-modified)
+// ─────────────────────────────────────────────────
+model Note {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  subjectId String   @map("subject_id")
+  topic     String?  // optional — links note to a specific session topic
+  content   String   @default("")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  user    User    @relation(fields: [userId],    references: [id], onDelete: Cascade)
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@map("notes")
+}

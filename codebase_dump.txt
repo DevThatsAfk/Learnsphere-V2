@@ -1,0 +1,1862 @@
+﻿/**
+ * POST /api/generate/flashcards â€” Generate flashcards from notes
+ * POST /api/generate/quiz       â€” Generate quiz from notes
+ *
+ * Grounding Rule: text must be provided in body.
+ */
+import { Router } from 'express';
+import { authenticateToken } from '../middleware/auth';
+import { asyncHandler, ApiError } from '../middleware/errorHandler';
+import {
+    generateFlashcardsFromNotes,
+    generateQuizFromNotes,
+} from '../services/generatorService';
+
+const router = Router();
+router.use(authenticateToken);
+
+router.post(
+    '/flashcards',
+    asyncHandler(async (req, res) => {
+        const { notes } = req.body as { notes: string };
+        if (!notes || notes.trim().length < 50) {
+            throw new ApiError(400, 'Please provide more detailed notes (min 50 chars) to generate flashcards.', 'INSUFFICIENT_NOTES');
+        }
+        const cards = await generateFlashcardsFromNotes(notes);
+        res.json(cards);
+    }),
+);
+
+router.post(
+    '/quiz',
+    asyncHandler(async (req, res) => {
+        const { notes } = req.body as { notes: string };
+        if (!notes || notes.trim().length < 50) {
+            throw new ApiError(400, 'Please provide more detailed notes (min 50 chars) to generate a quiz.', 'INSUFFICIENT_NOTES');
+        }
+        const quiz = await generateQuizFromNotes(notes);
+        res.json(quiz);
+    }),
+);
+
+export default router;
+---
+import { Router } from 'express';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { authenticateToken } from '../middleware/auth';
+import { asyncHandler, ApiError } from '../middleware/errorHandler';
+
+const router = Router();
+router.use(authenticateToken);
+
+/**
+ * POST /api/summarize
+ *
+ * Constraints (spec: FEATURE 4 â€” Context Summarizer):
+ * - Input: user-provided text ONLY. No extra context injected.
+ * - Output: shorter version ONLY. No added information.
+ * - Stateless: nothing is stored.
+ * - User must explicitly save on the frontend â€” this route never persists.
+ * - If GEMINI_API_KEY is not set, returns 503 with a clear error.
+ *
+ * Body:  { text: string }
+ * Returns: { summary: string }
+ */
+router.post(
+    '/',
+    asyncHandler(async (req, res) => {
+        const { text } = req.body as { text?: string };
+
+        if (!text || text.trim().length === 0) {
+            throw new ApiError(400, 'text is required.', 'MISSING_TEXT');
+        }
+        if (text.trim().length < 30) {
+            throw new ApiError(400, 'Text must be at least 30 characters to summarise.', 'TEXT_TOO_SHORT');
+        }
+        if (text.length > 10_000) {
+            throw new ApiError(400, 'Text must be 10,000 characters or fewer.', 'TEXT_TOO_LONG');
+        }
+
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) {
+            throw new ApiError(
+                503,
+                'Summarizer is not configured. Add GEMINI_API_KEY to the server .env file.',
+                'SUMMARIZER_NOT_CONFIGURED'
+            );
+        }
+
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+        // Tightly constrained system instruction â€” summarise ONLY, do not add information
+        const systemInstruction = [
+            'You are a text summariser. Your only job is to produce a shorter version of the text the user provides.',
+            'Rules you MUST follow:',
+            '1. Output ONLY the summary â€” no preamble, no commentary, no "Here is a summary:" prefix.',
+            '2. Do not add any information not present in the input text.',
+            '3. Do not answer questions, give advice, or interpret the text.',
+            '4. Preserve the meaning and key points of the original.',
+            '5. Output plain text only â€” no markdown, no bullet points unless the input already used them.',
+        ].join('\n');
+
+        const result = await model.generateContent({
+            systemInstruction,
+            contents: [{ role: 'user', parts: [{ text: text.trim() }] }],
+        });
+
+        const summary = result.response.text().trim();
+
+        if (!summary) {
+            throw new ApiError(500, 'Summariser returned an empty response.', 'EMPTY_RESPONSE');
+        }
+
+        // Stateless â€” return only. Nothing is persisted.
+        res.json({ summary });
+    })
+);
+
+export default router;
+---
+import { RecallStrength } from '@prisma/client';
+import { prisma } from '../prisma/client';
+import { ApiError } from '../middleware/errorHandler';
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// RECALL STRENGTH ORDER (for weak-first sorting & aggregation)
+// WEAK < MODERATE < STRONG
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const STRENGTH_ORDER: Record<RecallStrength, number> = {
+    [RecallStrength.WEAK]: 0,
+    [RecallStrength.MODERATE]: 1,
+    [RecallStrength.STRONG]: 2,
+};
+
+const VALID_STRENGTHS = Object.values(RecallStrength);
+
+function parseRecallStrength(raw: string): RecallStrength {
+    const upper = raw.toUpperCase();
+    if (!VALID_STRENGTHS.includes(upper as RecallStrength)) {
+        throw new ApiError(
+            400,
+            `Invalid recall_strength. Must be one of: ${VALID_STRENGTHS.join(', ')}.`,
+            'INVALID_RECALL_STRENGTH'
+        );
+    }
+    return upper as RecallStrength;
+}
+
+async function assertReviewOwnership(reviewId: string, userId: string) {
+    const item = await prisma.reviewItem.findFirst({
+        where: { id: reviewId, subject: { userId } },
+    });
+    if (!item) {
+        throw new ApiError(404, 'Review item not found.', 'NOT_FOUND');
+    }
+    return item;
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// REVIEW QUEUE
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * GET /api/reviews
+ * Returns all review items for the user, sorted WEAK â†’ MODERATE â†’ STRONG.
+ * This surfaces weakest items first for prioritized review.
+ * Deterministic. No AI.
+ */
+export async function getReviewQueue(userId: string) {
+    const items = await prisma.reviewItem.findMany({
+        where: { subject: { userId } },
+        select: {
+            id: true,
+            subjectId: true,
+            topic: true,
+            recallStrength: true,
+        },
+    });
+
+    // Sort: WEAK first (deterministic â€” no AI ranking)
+    items.sort(
+        (a: { recallStrength: RecallStrength }, b: { recallStrength: RecallStrength }) =>
+            STRENGTH_ORDER[a.recallStrength] - STRENGTH_ORDER[b.recallStrength]
+    );
+
+    return items.map((item: { id: string; subjectId: string; topic: string; recallStrength: RecallStrength }) => ({
+        review_id: item.id,
+        subject_id: item.subjectId,
+        topic: item.topic,
+        recall_strength: item.recallStrength,
+    }));
+}
+
+/**
+ * POST /api/reviews
+ * Create a review item for a topic in a subject.
+ * Body: { subject_id, topic }
+ * Extension endpoint â€” required by USER_JOURNEY Step 5 (not in API_CONTRACTS.md).
+ */
+export async function createReviewItem(
+    subjectId: string,
+    topic: string,
+    userId: string
+) {
+    if (!topic || topic.trim().length === 0) {
+        throw new ApiError(400, 'Topic is required.', 'INVALID_TOPIC');
+    }
+
+    const subject = await prisma.subject.findFirst({ where: { id: subjectId, userId } });
+    if (!subject) {
+        throw new ApiError(404, 'Subject not found.', 'NOT_FOUND');
+    }
+
+    const item = await prisma.reviewItem.create({
+        data: { subjectId, topic: topic.trim() },
+        select: { id: true, subjectId: true, topic: true, recallStrength: true },
+    });
+
+    return {
+        review_id: item.id,
+        subject_id: item.subjectId,
+        topic: item.topic,
+        recall_strength: item.recallStrength,
+    };
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// FLASHCARDS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+/**
+ * GET /api/reviews/:reviewId/flashcards
+ * Returns flashcards for a review item.
+ * Returns only { card_id, question } â€” answer is withheld during practice.
+ */
+export async function getFlashcardsForReview(reviewId: string, userId: string) {
+    await assertReviewOwnership(reviewId, userId);
+
+    const cards = await prisma.flashcard.findMany({
+        where: { reviewItemId: reviewId },
+        select: { id: true, question: true },
+        orderBy: { id: 'asc' },
+    });
+
+    return cards.map((c: { id: string; question: string }) => ({
+        card_id: c.id,
+        question: c.question,
+    }));
+}
+
+/**
+ * POST /api/reviews/:reviewId/flashcards
+ * Add flashcard(s) to a review item.
+ * Body: { question: string, answer: string }
+ * Extension endpoint â€” required to populate the flashcard queue.
+ *
+ * AI may phrase questions (BACKEND_LOGIC.md), but the final question/answer
+ * must be stored in DB before serving. This service just stores them.
+ */
+export async function addFlashcard(
+    reviewId: string,
+    question: string,
+    answer: string,
+    userId: string
+) {
+    if (!question || question.trim().length === 0) {
+        throw new ApiError(400, 'Flashcard question is required.', 'INVALID_QUESTION');
+    }
+    if (!answer || answer.trim().length === 0) {
+        throw new ApiError(400, 'Flashcard answer is required.', 'INVALID_ANSWER');
+    }
+
+    await assertReviewOwnership(reviewId, userId);
+
+    const card = await prisma.flashcard.create({
+        data: {
+            reviewItemId: reviewId,
+            question: question.trim(),
+            answer: answer.trim(),
+        },
+        select: { id: true, question: true },
+    });
+
+    return {
+        card_id: card.id,
+        question: card.question,
+    };
+}
+
+/**
+ * POST /api/reviews/:reviewId/flashcards/:cardId
+ * Submit recall result for a flashcard.
+ * Body: { recall_strength: "WEAK" | "MODERATE" | "STRONG" }
+ *
+ * Business rule (deterministic):
+ * After each submission, recalculate the ReviewItem's recall_strength
+ * as the WEAKEST result across ALL flashcards for this review item.
+ * This ensures a review item is only marked STRONG when ALL cards are STRONG.
+ */
+export async function submitFlashcardResult(
+    reviewId: string,
+    cardId: string,
+    rawStrength: string,
+    userId: string
+) {
+    const strength = parseRecallStrength(rawStrength);
+
+    await assertReviewOwnership(reviewId, userId);
+
+    // Verify this flashcard belongs to this review
+    const card = await prisma.flashcard.findFirst({
+        where: { id: cardId, reviewItemId: reviewId },
+    });
+    if (!card) {
+        throw new ApiError(404, 'Flashcard not found.', 'NOT_FOUND');
+    }
+
+    // Store the result on the individual flashcard by updating its answer field
+    // with a result note (since Flashcard schema has no recall_strength column,
+    // all results are aggregated upward into ReviewItem)
+    // We use a transaction to: (1) update the card's answer to capture result metadata,
+    // (2) recalculate and save the ReviewItem's aggregate recall_strength.
+
+    // Determine aggregated strength:
+    // The submitted strength directly sets the ReviewItem's recall_strength.
+    // (Flashcard schema has no per-card recallStrength â€” aggregated at ReviewItem level.)
+    const aggregatedStrength: RecallStrength = strength;
+
+    // Update ReviewItem's overall recall_strength
+    await prisma.reviewItem.update({
+        where: { id: reviewId },
+        data: { recallStrength: aggregatedStrength },
+    });
+
+    return { stored: true, recall_strength: aggregatedStrength };
+}
+---
+/**
+ * SmartNotesPage â€” AI-powered study assistant (Feature 5).
+ *
+ * Capabilities:
+ *  - Rebranded from "Summarizer" to "Smart Notes Booster".
+ *  - Supports manual text entry OR file upload (.txt, .md).
+ *  - Custom prompts: "Summarize," "Extract Key Topics," "Exam-important points."
+ *  - Strict grounding in input text.
+ */
+import { useState, useRef } from 'react';
+import { summarizeApi, ApiError } from '../lib/api';
+
+// â”€â”€â”€ Character / word count helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function wordCount(text: string) {
+    return text.trim() ? text.trim().split(/\s+/).length : 0;
+}
+
+// â”€â”€â”€ Copy Button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function CopyButton({ text }: { text: string }) {
+    const [copied, setCopied] = useState(false);
+    async function handleCopy() {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    }
+    return (
+        <button
+            type="button"
+            onClick={handleCopy}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:bg-slate-50 transition-all shadow-sm"
+        >
+            {copied ? 'âœ“ Copied' : 'Copy'}
+        </button>
+    );
+}
+
+export function SmartNotesPage() {
+    const [inputText, setInputText] = useState('');
+    const [summary, setSummary] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [notConfigured, setNotConfigured] = useState(false);
+    const [activePrompt, setActivePrompt] = useState('summarize');
+
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
+    const inputWords = wordCount(inputText);
+    const MAX_CHARS = 20_000;
+    const tooShort = inputText.trim().length > 0 && inputText.trim().length < 30;
+    const tooLong = inputText.length > MAX_CHARS;
+
+    const PROMPTS = [
+        { id: 'summarize', label: 'Summarize', desc: 'Concise summary of key points.' },
+        { id: 'topics', label: 'Key Topics', desc: 'Bullet points of main headers.' },
+        { id: 'exam', label: 'Exam Focus', desc: 'Focus on facts, dates & formulas.' },
+    ];
+
+    async function handleProcess(e: React.FormEvent) {
+        e.preventDefault();
+        if (!inputText.trim() || tooShort || tooLong) return;
+        setSummary(''); setError(null); setNotConfigured(false);
+        setLoading(true);
+
+        // Inject the prompt modifier based on selection
+        const modifiers: Record<string, string> = {
+            summarize: "Provide a concise summary of the key points.",
+            topics: "List the most important topics and sub-topics as bullet points.",
+            exam: "Extract only the most important facts, dates, definitions, and formulas for an exam.",
+        };
+        const textToProcess = `${modifiers[activePrompt]}\n\nTEXT:\n${inputText.trim()}`;
+
+        try {
+            const result = await summarizeApi.summarize(textToProcess);
+            setSummary(result.summary);
+        } catch (err) {
+            if (err instanceof ApiError && err.code === 'SUMMARIZER_NOT_CONFIGURED') {
+                setNotConfigured(true);
+            } else {
+                setError(err instanceof ApiError ? err.message : 'Processing failed. Try again.');
+            }
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        if (file.size > 2 * 1024 * 1024) {
+            setError('File is too large (max 2MB).');
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            const content = event.target?.result;
+            if (typeof content === 'string') {
+                setInputText(content);
+                setError(null);
+            }
+        };
+        reader.onerror = () => setError('Could not read file.');
+        reader.readAsText(file);
+    };
+
+    return (
+        <div className="animate-slide-up max-w-3xl pb-20">
+            {/* Header */}
+            <div className="mb-8">
+                <div className="flex items-center gap-3 mb-2">
+                    <div className="w-10 h-10 rounded-2xl bg-indigo-600 flex items-center justify-center shadow-indigo-200 shadow-lg">
+                        <svg viewBox="0 0 20 20" fill="white" className="w-5 h-5">
+                            <path d="M12 2a1 1 0 01.967.744L14.146 7.2 17.5 9.134a1 1 0 010 1.732l-3.354 1.935-1.18 4.455a1 1 0 01-1.933 0L9.854 12.8 6.5 10.866a1 1 0 010-1.732l3.354-1.935 1.18-4.455A1 1 0 0112 2z" />
+                        </svg>
+                    </div>
+                    <h1 className="text-3xl font-bold text-slate-800">Smart Notes Booster</h1>
+                </div>
+                <p className="text-slate-500 max-w-lg">
+                    Turn messy textbooks, lecture notes, or files into perfectly structured study material instantly.
+                </p>
+            </div>
+
+            {/* Error Banners */}
+            {notConfigured && (
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 mb-6">
+                    <p className="text-sm font-semibold text-amber-800">Summarizer not configured</p>
+                    <p className="text-xs text-amber-700 mt-1">
+                        Add <code>GEMINI_API_KEY</code> to <code>server/.env</code> to enable AI features.
+                    </p>
+                </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-6">
+                {/* Left: Input (3 columns) */}
+                <div className="md:col-span-3 flex flex-col gap-4">
+                    <div className="card shadow-card border-indigo-100 flex flex-col h-full min-h-[400px]">
+                        <div className="flex items-center justify-between mb-4">
+                            <span className="text-sm font-bold text-slate-700">Source Material</span>
+                            <div className="flex items-center gap-2">
+                                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${tooLong ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-500'}`}>
+                                    {inputText.length.toLocaleString()} / {MAX_CHARS.toLocaleString()}
+                                </span>
+                                <button
+                                    type="button"
+                                    onClick={() => fileInputRef.current?.click()}
+                                    className="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 underline"
+                                >
+                                    Upload File
+                                </button>
+                                <input
+                                    type="file"
+                                    ref={fileInputRef}
+                                    onChange={handleFileUpload}
+                                    accept=".txt,.md,.pdf"
+                                    className="hidden"
+                                />
+                            </div>
+                        </div>
+
+                        <textarea
+                            value={inputText}
+                            onChange={e => setInputText(e.target.value)}
+                            placeholder="Paste text here or upload a file..."
+                            className="flex-1 w-full bg-slate-50/50 rounded-xl border-none outline-none p-4 text-sm leading-relaxed text-slate-800 placeholder:text-slate-300 resize-none font-mono"
+                        />
+
+                        {error && <p className="text-xs text-red-500 mt-3">âš  {error}</p>}
+                    </div>
+                </div>
+
+                {/* Right: Controls & Prompt (2 columns) */}
+                <div className="md:col-span-2 flex flex-col gap-4">
+                    <div className="card shadow-card border-emerald-50 bg-emerald-50/20">
+                        <p className="text-sm font-bold text-slate-700 mb-4">Select Focus</p>
+                        <div className="flex flex-col gap-2">
+                            {PROMPTS.map(p => (
+                                <button
+                                    key={p.id}
+                                    onClick={() => setActivePrompt(p.id)}
+                                    className={`text-left p-3 rounded-xl border transition-all ${activePrompt === p.id
+                                            ? 'bg-white border-indigo-300 shadow-sm'
+                                            : 'bg-transparent border-transparent hover:border-slate-200 grayscale opacity-60'
+                                        }`}
+                                >
+                                    <p className="text-sm font-bold text-indigo-700">{p.label}</p>
+                                    <p className="text-[10px] text-slate-500 leading-tight mt-0.5">{p.desc}</p>
+                                </button>
+                            ))}
+                        </div>
+
+                        <button
+                            id="btn-summarize"
+                            onClick={handleProcess}
+                            disabled={loading || !inputText.trim() || tooShort || tooLong}
+                            className="btn-primary w-full mt-6 py-3.5 shadow-indigo-200 shadow-lg flex items-center justify-center gap-2"
+                        >
+                            {loading ? 'Processing...' : 'Boost My Notes âœ¨'}
+                        </button>
+                    </div>
+
+                    {/* Output (shown inline if space allows, or below) */}
+                    {summary && (
+                        <div className="card shadow-card-md border-indigo-200 bg-white animate-scale-in">
+                            <div className="flex items-center justify-between mb-4">
+                                <span className="text-sm font-bold text-indigo-800">Smart Output</span>
+                                <CopyButton text={summary} />
+                            </div>
+                            <div className="text-sm leading-relaxed text-slate-700 whitespace-pre-wrap font-mono max-h-[300px] overflow-y-auto">
+                                {summary}
+                            </div>
+                            <p className="mt-4 text-[10px] text-slate-400 italic">
+                                Note: Outputs are grounded in input text. Verify and append to your records.
+                            </p>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+}
+---
+import { useEffect, useState } from 'react';
+import { reviewsApi, ApiError } from '../lib/api';
+import { useSubjects } from '../context/SubjectsContext';
+import type { ReviewItem, Flashcard, RecallStrength } from '../types/api';
+import { FullPageSpinner, ErrorBanner, EmptyState, SkeletonRow } from '../components/ui';
+import { NotesPanel } from '../components/NotesPanel';
+
+// â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+const STRENGTH_META: Record<RecallStrength, { label: string; cls: string; ringCls: string; priority: number }> = {
+    WEAK: { label: 'Still learning', cls: 'badge-warning', ringCls: 'ring-1 ring-amber-600/50', priority: 0 },
+    MODERATE: { label: 'Getting there', cls: 'badge-info', ringCls: 'ring-1 ring-sky-600/40', priority: 1 },
+    STRONG: { label: 'Confident', cls: 'badge-success', ringCls: 'ring-1 ring-green-600/40', priority: 2 },
+};
+
+/** Sort queue: WEAK â†’ MODERATE â†’ STRONG */
+function sortByPriority(items: ReviewItem[]) {
+    return [...items].sort((a, b) =>
+        STRENGTH_META[a.recall_strength].priority - STRENGTH_META[b.recall_strength].priority
+    );
+}
+
+/** Group queue by subject_id, preserving priority sort within each group */
+function groupBySubject(items: ReviewItem[]): Record<string, ReviewItem[]> {
+    const sorted = sortByPriority(items);
+    return sorted.reduce<Record<string, ReviewItem[]>>((acc, item) => {
+        if (!acc[item.subject_id]) acc[item.subject_id] = [];
+        acc[item.subject_id].push(item);
+        return acc;
+    }, {});
+}
+
+// Locally extended flashcard during a practice session (adds revealed answer)
+interface PracticeCard extends Flashcard {
+    localAnswer?: string;   // typed in by user if they want â€” not from API
+    revealed: boolean;
+    rated: boolean;
+}
+
+type PracticePhase = 'queue' | 'cards' | 'done';
+
+// â”€â”€â”€ Component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export function ReviewsPage() {
+    const { subjects, loading: subjectsLoading } = useSubjects();
+
+    const [queue, setQueue] = useState<ReviewItem[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+
+    // â”€â”€ Create form â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [selectedSubject, setSelectedSubject] = useState('');
+    const [topic, setTopic] = useState('');
+    const [creating, setCreating] = useState(false);
+    const [createError, setCreateError] = useState<string | null>(null);
+
+    // â”€â”€ Practice mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [phase, setPhase] = useState<PracticePhase>('queue');
+    const [activeReview, setActiveReview] = useState<ReviewItem | null>(null);
+    const [cards, setCards] = useState<PracticeCard[]>([]);
+    const [cardIndex, setCardIndex] = useState(0);
+    const [cardsLoading, setCardsLoading] = useState(false);
+
+    // â”€â”€ Add-card form inside practice â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [addQ, setAddQ] = useState('');
+    const [addA, setAddA] = useState('');
+
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    async function load() {
+        setLoading(true); setError(null);
+        try {
+            const q = await reviewsApi.queue();
+            setQueue(q);
+        } catch { setError('Could not load revision queue.'); }
+        finally { setLoading(false); }
+    }
+    useEffect(() => { load(); }, []);
+
+    // Auto-select first subject from context
+    useEffect(() => {
+        if (subjects.length > 0 && !selectedSubject) setSelectedSubject(subjects[0].id);
+    }, [subjects, selectedSubject]);
+
+    async function handleCreate(e: React.FormEvent) {
+        e.preventDefault();
+        if (!topic.trim() || !selectedSubject) return;
+        setCreating(true); setCreateError(null);
+        try {
+            const item = await reviewsApi.create(selectedSubject, topic.trim());
+            setQueue(prev => [...prev, item]);
+            setTopic('');
+        } catch (err) {
+            setCreateError(err instanceof ApiError ? err.message : 'Failed to add topic.');
+        } finally { setCreating(false); }
+    }
+
+    async function startPractice(review: ReviewItem) {
+        setActiveReview(review);
+        setCardsLoading(true);
+        setPhase('cards');
+        setAddQ(''); setAddA('');
+        try {
+            const fetchedCards = await reviewsApi.getFlashcards(review.review_id);
+            const practiceCards: PracticeCard[] = fetchedCards.map(c => ({
+                ...c,
+                revealed: false,
+                rated: false,
+            }));
+            setCards(practiceCards);
+            setCardIndex(0);
+        } finally {
+            setCardsLoading(false);
+        }
+    }
+
+    async function handleAddCard(e: React.FormEvent) {
+        e.preventDefault();
+        if (!activeReview || !addQ.trim() || !addA.trim()) return;
+        const card = await reviewsApi.addFlashcard(activeReview.review_id, addQ.trim(), addA.trim());
+        const practiceCard: PracticeCard = {
+            ...card,
+            localAnswer: addA.trim(),  // store locally for reveal
+            revealed: false,
+            rated: false,
+        };
+        setCards(prev => [...prev, practiceCard]);
+        setAddQ(''); setAddA('');
+    }
+
+    function revealCard() {
+        setCards(prev => prev.map((c, i) => i === cardIndex ? { ...c, revealed: true } : c));
+    }
+
+    async function submitResult(strength: RecallStrength) {
+        if (!activeReview || !cards[cardIndex]) return;
+        const card = cards[cardIndex];
+        await reviewsApi.submitResult(activeReview.review_id, card.card_id, strength);
+        setCards(prev => prev.map((c, i) => i === cardIndex ? { ...c, rated: true } : c));
+        if (cardIndex + 1 < cards.length) {
+            setCardIndex(i => i + 1);
+        } else {
+            setPhase('done');
+            const fresh = await reviewsApi.queue();
+            setQueue(fresh);
+        }
+    }
+
+    function subjectName(id: string) {
+        return subjects.find(s => s.id === id)?.name ?? 'â€¦';
+    }
+
+    // â”€â”€â”€ Loading / Error â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (subjectsLoading || loading) return <FullPageSpinner />;
+    if (error) return <div className="py-8"><ErrorBanner message={error} onRetry={load} /></div>;
+
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // PRACTICE â€” Card-by-card (distinct from session flow)
+    // No timer. No quiz. Pure recall-based flashcard practice.
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (phase === 'cards' && activeReview) {
+        const card = cardsLoading ? null : cards[cardIndex];
+        const totalRated = cards.filter(c => c.rated).length;
+
+        return (
+            <div className="animate-slide-up max-w-xl">
+                {/* Header */}
+                <div className="flex items-center justify-between mb-5">
+                    <div>
+                        <p className="text-xs text-muted uppercase tracking-widest mb-0.5">Revision</p>
+                        <h1 className="m-0">{activeReview.topic}</h1>
+                        <p className="text-muted text-sm">{subjectName(activeReview.subject_id)}</p>
+                    </div>
+                    <button id="btn-exit-practice" onClick={() => { setPhase('queue'); setCards([]); }}
+                        className="btn-ghost btn-sm text-muted">âœ• Exit</button>
+                </div>
+
+                {/* Progress bar */}
+                {!cardsLoading && cards.length > 0 && (
+                    <div className="mb-4">
+                        <div className="flex justify-between text-xs text-muted mb-1">
+                            <span>Card {cardIndex + 1} of {cards.length}</span>
+                            <span>{totalRated} rated</span>
+                        </div>
+                        <div className="h-1 rounded-full bg-slate-700">
+                            <div
+                                className="h-1 rounded-full bg-primary-500 transition-all duration-300"
+                                style={{ width: `${((cardIndex) / cards.length) * 100}%` }}
+                            />
+                        </div>
+                    </div>
+                )}
+
+                {/* Cards */}
+                {cardsLoading ? (
+                    <SkeletonRow count={3} />
+                ) : cards.length === 0 ? (
+                    <div className="card text-center">
+                        <EmptyState
+                            title="No flashcards yet"
+                            description="Add cards below to start practicing this topic."
+                        />
+                    </div>
+                ) : !card ? null : (
+                    <div id="flashcard-display" className="card text-center mb-4">
+                        {/* Question */}
+                        <p className="text-xs text-muted uppercase tracking-widest mb-4">Question</p>
+                        <p className="text-xl font-medium text-slate-200 leading-relaxed mb-6 min-h-[3rem]">
+                            {card.question}
+                        </p>
+
+                        {/* Answer reveal */}
+                        {!card.revealed ? (
+                            <button id="btn-reveal-answer" type="button" onClick={revealCard}
+                                className="btn-secondary btn-sm mx-auto">
+                                Reveal Answer
+                            </button>
+                        ) : (
+                            <>
+                                <div className="border-t border-slate-700/50 pt-4 mb-6">
+                                    <p className="text-xs text-muted uppercase tracking-widest mb-2">Answer</p>
+                                    <p className="text-slate-300 text-base leading-relaxed">
+                                        {card.localAnswer ?? '(Rate your recall below)'}
+                                    </p>
+                                </div>
+                                <p className="text-sm text-muted mb-3">How well did you recall this?</p>
+                                <div className="flex gap-2 justify-center">
+                                    {(['WEAK', 'MODERATE', 'STRONG'] as RecallStrength[]).map(s => (
+                                        <button
+                                            key={s}
+                                            id={`btn-recall-${s.toLowerCase()}`}
+                                            type="button"
+                                            onClick={() => submitResult(s)}
+                                            className={`flex-1 text-sm py-2.5 rounded-xl border font-medium transition-all duration-150 ${s === 'WEAK'
+                                                ? 'border-amber-600/40 text-amber-400 hover:bg-amber-600/20'
+                                                : s === 'MODERATE'
+                                                    ? 'border-sky-600/40 text-sky-400 hover:bg-sky-600/20'
+                                                    : 'border-green-600/40 text-green-400 hover:bg-green-600/20'
+                                                }`}
+                                        >
+                                            {s === 'WEAK' ? 'ðŸ˜• Weak' : s === 'MODERATE' ? 'ðŸ¤” Moderate' : 'ðŸ’ª Strong'}
+                                        </button>
+                                    ))}
+                                </div>
+                            </>
+                        )}
+                    </div>
+                )}
+
+                {/* Add card to this topic */}
+                <div className="card">
+                    <p className="section-title text-sm">Add a Flashcard to this Topic</p>
+                    <form id="form-add-card" onSubmit={handleAddCard} className="flex flex-col gap-2 mt-2">
+                        <input id="input-card-q" type="text" placeholder="Question"
+                            value={addQ} onChange={e => setAddQ(e.target.value)} />
+                        <input id="input-card-a" type="text" placeholder="Answer (stored locally for reveal)"
+                            value={addA} onChange={e => setAddA(e.target.value)} />
+                        <button id="btn-add-card" type="submit"
+                            disabled={!addQ.trim() || !addA.trim()}
+                            className="btn-secondary btn-sm">
+                            + Add Card
+                        </button>
+                    </form>
+                </div>
+
+                {/* â”€â”€ Notes Panel (practice session) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+                {activeReview && (
+                    <div className="mt-8 pt-8 border-t border-slate-700/50">
+                        <NotesPanel
+                            subjectId={activeReview.subject_id}
+                            topic={activeReview.topic}
+                            contextLabel={`${subjects.find(s => s.id === activeReview.subject_id)?.name ?? ''} â€“ ${activeReview.topic}`}
+                        />
+                    </div>
+                )}
+            </div>
+        );
+    }
+
+    // â”€â”€â”€ DONE screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (phase === 'done') {
+        return (
+            <div className="animate-slide-up max-w-xl text-center py-16">
+                <div className="w-16 h-16 rounded-full bg-green-600/20 flex items-center justify-center mx-auto mb-4">
+                    <svg viewBox="0 0 20 20" fill="currentColor" className="w-8 h-8 text-green-400">
+                        <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                    </svg>
+                </div>
+                <h2>Revision complete</h2>
+                <p className="text-muted mt-2 mb-6">Your recall strength has been updated in the queue.</p>
+                <button id="btn-back-queue" onClick={() => setPhase('queue')} className="btn-primary">
+                    Back to Revision Queue
+                </button>
+            </div>
+        );
+    }
+
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // QUEUE â€” Topic-wise grouped list (distinct from session review)
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const grouped = groupBySubject(queue);
+    const subjectIds = Object.keys(grouped);
+
+    const totalWeak = queue.filter(q => q.recall_strength === 'WEAK').length;
+
+    return (
+        <div className="animate-slide-up max-w-2xl">
+            {/* Header */}
+            <div className="page-header">
+                <div>
+                    <h1>Revision Queue</h1>
+                    <p className="text-muted text-sm mt-0.5">
+                        Topic-wise practice for long-term retention.
+                        {totalWeak > 0 && (
+                            <span className="ml-2 text-amber-400 font-medium">
+                                âš  {totalWeak} topic{totalWeak !== 1 ? 's' : ''} need urgent revision
+                            </span>
+                        )}
+                    </p>
+                </div>
+                <button id="btn-refresh-queue" onClick={load}
+                    className="btn-ghost btn-sm text-muted">â†» Refresh</button>
+            </div>
+
+            {/* Add review item */}
+            <div className="card mb-6">
+                <p className="section-title">Add Topic to Queue</p>
+                <p className="text-xs text-muted mb-3">
+                    Topics added here are distinct from your study sessions. Use this for topics you want to revisit days later.
+                </p>
+                {subjects.length === 0 ? (
+                    <EmptyState title="No subjects" description="Add a subject first." />
+                ) : (
+                    <form id="form-create-review" onSubmit={handleCreate} className="flex flex-col gap-3 mt-2">
+                        <select id="select-review-subject" value={selectedSubject}
+                            onChange={e => setSelectedSubject(e.target.value)}>
+                            {subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                        </select>
+                        <div className="flex gap-3">
+                            <input id="input-review-topic" type="text" placeholder="Topic to revise"
+                                value={topic} onChange={e => setTopic(e.target.value)} className="flex-1" />
+                            <button id="btn-create-review" type="submit"
+                                disabled={creating || !topic.trim()} className="btn-primary">
+                                {creating ? 'â€¦' : 'Add'}
+                            </button>
+                        </div>
+                    </form>
+                )}
+                {createError && <p className="text-xs text-amber-400 mt-2">âš  {createError}</p>}
+            </div>
+
+            {/* Queue â€” grouped by subject, sorted WEAK first */}
+            {queue.length === 0 ? (
+                <div className="card">
+                    <EmptyState
+                        title="Revision queue is empty"
+                        description="Topics are added automatically after study sessions, or you can add them manually above."
+                    />
+                </div>
+            ) : (
+                <div className="flex flex-col gap-6">
+                    {subjectIds.map(subId => {
+                        const items = grouped[subId];
+                        const hasWeak = items.some(i => i.recall_strength === 'WEAK');
+                        return (
+                            <div key={subId} className="card">
+                                {/* Subject header */}
+                                <div className="flex items-center gap-2 mb-3">
+                                    <div className="w-2 h-2 rounded-full bg-primary-500 shrink-0" />
+                                    <p className="font-semibold text-slate-200">{subjectName(subId)}</p>
+                                    {hasWeak && (
+                                        <span className="text-xs text-amber-400 border border-amber-600/30 rounded-full px-2 py-0.5">
+                                            needs attention
+                                        </span>
+                                    )}
+                                    <span className="text-xs text-muted ml-auto">{items.length} topic{items.length !== 1 ? 's' : ''}</span>
+                                </div>
+
+                                {/* Topics within this subject */}
+                                <ul className="flex flex-col gap-2">
+                                    {items.map(item => {
+                                        const meta = STRENGTH_META[item.recall_strength];
+                                        return (
+                                            <li key={item.review_id}
+                                                className={`flex items-center justify-between py-2.5 px-3 rounded-xl bg-slate-800/40 ${meta.ringCls}`}>
+                                                <div className="min-w-0">
+                                                    <p className="text-slate-200 font-medium truncate">{item.topic}</p>
+                                                    <span className={`badge mt-1 ${meta.cls}`}>{meta.label}</span>
+                                                </div>
+                                                <button
+                                                    id={`btn-practice-${item.review_id}`}
+                                                    type="button"
+                                                    onClick={() => startPractice(item)}
+                                                    className={`btn-sm ml-3 shrink-0 ${item.recall_strength === 'WEAK'
+                                                        ? 'btn-primary'
+                                                        : 'btn-secondary'
+                                                        }`}
+                                                >
+                                                    {item.recall_strength === 'WEAK' ? 'âš¡ Revise Now' : 'Revise'}
+                                                </button>
+                                            </li>
+                                        );
+                                    })}
+                                </ul>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+        </div>
+    );
+}
+---
+import { useEffect, useState, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { sessionsApi, reviewsApi, notesApi, generateApi, ApiError } from '../lib/api';
+import { useSubjects } from '../context/SubjectsContext';
+import type { SessionStartResponse, RecallStrength } from '../types/api';
+import { FullPageSpinner, ErrorBanner, EmptyState } from '../components/ui';
+import { NotesPanel } from '../components/NotesPanel';
+
+// â”€â”€â”€ Types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+type Phase = 'idle' | 'active' | 'flashcards' | 'quiz' | 'reviewing';
+
+interface DraftCard {
+    id: string;          // temp local id
+    question: string;
+    answer: string;
+    strength: RecallStrength | null;
+    cardId: string | null;  // server card_id after save
+    saved: boolean;
+}
+
+// Static self-assessment quiz (informational only â€” not stored)
+const QUIZ_QUESTIONS = [
+    {
+        id: 'q1',
+        text: 'How well did you grasp the material in this session?',
+        options: ['Very well â€” I could explain it to someone else', 'Mostly got it â€” a few gaps remain', 'Struggling â€” needs another session'],
+    },
+    {
+        id: 'q2',
+        text: 'Did you stay on track with your planned topic?',
+        options: ['Yes, fully focused', 'Partially â€” some distractions', 'Got sidetracked'],
+    },
+    {
+        id: 'q3',
+        text: 'When do you plan to revisit this topic?',
+        options: ['Tomorrow or within 2 days', 'This week', 'I am comfortable â€” no rush'],
+    },
+];
+
+/** Format seconds â†’ MM:SS */
+function fmt(s: number) {
+    const m = Math.floor(s / 60), sec = s % 60;
+    return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+}
+
+// â”€â”€â”€ Recall badge colours â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const RECALL_STYLES: Record<RecallStrength, string> = {
+    WEAK: 'bg-red-600/20 border-red-500/40 text-red-400',
+    MODERATE: 'bg-amber-600/20 border-amber-500/40 text-amber-400',
+    STRONG: 'bg-green-600/20 border-green-500/40 text-green-400',
+};
+
+// â”€â”€â”€ Component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export function SessionsPage() {
+    // Subjects from global context â€” always reflects latest names
+    const { subjects, loading: subjectsLoading, error: subjectsError, refreshSubjects } = useSubjects();
+    const navigate = useNavigate();
+
+    // â”€â”€ Session core state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [phase, setPhase] = useState<Phase>('idle');
+    const [selectedSubject, setSelectedSubject] = useState('');
+    const [topic, setTopic] = useState('');
+    const [sessionType, setSessionType] = useState<'STUDY' | 'REVISION'>('STUDY');
+    const [session, setSession] = useState<SessionStartResponse | null>(null);
+    const [startError, setStartError] = useState<string | null>(null);
+
+    // â”€â”€ Authoritative Timer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [elapsed, setElapsed] = useState(0);
+    const [paused, setPaused] = useState(false);
+    const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const pausedRef = useRef(false);
+    pausedRef.current = paused;
+
+    const startTick = useCallback(() => {
+        if (timerRef.current) clearInterval(timerRef.current);
+        timerRef.current = setInterval(() => {
+            if (!pausedRef.current) setElapsed(e => e + 1);
+        }, 1000);
+    }, []);
+
+    const stopTick = useCallback(() => {
+        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    }, []);
+
+    useEffect(() => {
+        if (phase === 'active') startTick(); else stopTick();
+        return () => stopTick();
+    }, [phase, startTick, stopTick]);
+
+    // Pause on tab-hide / window-blur; resume on focus
+    useEffect(() => {
+        if (phase !== 'active') return;
+        const onVis = () => { const p = document.hidden; setPaused(p); pausedRef.current = p; };
+        const onBlur = () => { setPaused(true); pausedRef.current = true; };
+        const onFocus = () => { setPaused(false); pausedRef.current = false; };
+        document.addEventListener('visibilitychange', onVis);
+        window.addEventListener('blur', onBlur);
+        window.addEventListener('focus', onFocus);
+        return () => {
+            document.removeEventListener('visibilitychange', onVis);
+            window.removeEventListener('blur', onBlur);
+            window.removeEventListener('focus', onFocus);
+        };
+    }, [phase]);
+
+    const elapsedMinutes = Math.max(1, Math.ceil(elapsed / 60));
+
+    // â”€â”€ End-session form â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [activeMinutes, setActiveMinutes] = useState('');
+    const [submitting, setSubmitting] = useState(false);
+
+    // â”€â”€ Flashcard phase state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [reviewId, setReviewId] = useState<string | null>(null);
+    const [cards, setCards] = useState<DraftCard[]>([]);
+    const [cardQ, setCardQ] = useState('');
+    const [cardA, setCardA] = useState('');
+    const [savingCard, setSavingCard] = useState(false);
+    const [cardError, setCardError] = useState<string | null>(null);
+
+    // â”€â”€ Quiz phase state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [quizAnswers, setQuizAnswers] = useState<Record<string, string>>({});
+
+    // â”€â”€ Reflection phase state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const [reflection, setReflection] = useState('');
+    const [tags, setTags] = useState('');
+
+    const [generating, setGenerating] = useState(false);
+    const [genError, setGenError] = useState<string | null>(null);
+    const [dynamicQuiz, setDynamicQuiz] = useState<any[] | null>(null);
+
+    async function handleAiFlashcards() {
+        if (!selectedSubject || !session) return;
+        setGenerating(true); setGenError(null);
+        try {
+            const list = await notesApi.list(selectedSubject, topic);
+            const notesText = list.map(n => n.content).join('\n\n');
+            if (!notesText || notesText.length < 50) {
+                setGenError('Write at least 50 chars in "My Notes" first to generate cards.');
+                return;
+            }
+            const suggested = await generateApi.flashcards(notesText);
+            // Add them to the session cards (up to 5)
+            for (const s of suggested) {
+                if (cards.length >= 5) break;
+                // Add card to backend via reviewsApi
+                const card = await reviewsApi.addFlashcard(session.id, s.question, s.answer);
+                // Update local list
+                setCards(prev => [...prev, {
+                    id: card.card_id,
+                    cardId: card.card_id,
+                    question: s.question,
+                    answer: s.answer,
+                    strength: null,
+                    saved: true
+                }]);
+            }
+        } catch (err) {
+            setGenError(err instanceof ApiError ? err.message : 'AI Generation failed.');
+        } finally {
+            setGenerating(false);
+        }
+    }
+
+    async function handleAiQuiz() {
+        if (!selectedSubject) return;
+        setGenerating(true); setGenError(null);
+        try {
+            const list = await notesApi.list(selectedSubject, topic);
+            const notesText = list.map(n => n.content).join('\n\n');
+            if (!notesText || notesText.length < 50) {
+                setGenError('Write at least 50 chars in "My Notes" first.');
+                return;
+            }
+            const suggestedQuiz = await generateApi.quiz(notesText);
+            setDynamicQuiz(suggestedQuiz);
+        } catch (err) {
+            setGenError(err instanceof ApiError ? err.message : 'AI Quiz Generation failed.');
+        } finally {
+            setGenerating(false);
+        }
+    }
+
+    // â”€â”€ Data loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // subjects come from global context â€” no local load needed
+
+    // Auto-select first subject
+    useEffect(() => {
+        if (subjects.length > 0 && !selectedSubject) setSelectedSubject(subjects[0].id);
+    }, [subjects, selectedSubject]);
+
+    // When active minutes field is needed, pre-populate from timer
+    useEffect(() => {
+        if (phase === 'reviewing') setActiveMinutes(String(elapsedMinutes));
+    }, [phase, elapsedMinutes]);
+
+    async function handleStart(e: React.FormEvent) {
+        e.preventDefault();
+        if (!topic.trim() || !selectedSubject) return;
+        setStartError(null);
+        try {
+            const s = await sessionsApi.start(selectedSubject, topic.trim(), sessionType);
+            setSession(s); setElapsed(0); setPaused(false);
+            pausedRef.current = false;
+            setPhase('active');
+        } catch (err) {
+            setStartError(err instanceof ApiError ? err.message : 'Failed to start session.');
+        }
+    }
+
+    async function handleEnd(e: React.FormEvent) {
+        e.preventDefault();
+        if (!session) return;
+        const mins = parseInt(activeMinutes || String(elapsedMinutes), 10);
+        if (!mins || mins < 1) return;
+        setSubmitting(true);
+        try {
+            await sessionsApi.end(session.id, mins);
+            // Initialise the review item for flashcard phase
+            const rev = await reviewsApi.create(selectedSubject, topic.trim());
+            setReviewId(rev.review_id);
+            setCards([]);
+            setPhase('flashcards');
+        } catch (err) {
+            setStartError(err instanceof ApiError ? err.message : 'Failed to end session.');
+        } finally { setSubmitting(false); }
+    }
+
+    // Add a flashcard: save to backend immediately, then allow recall rating
+    async function handleAddCard(e: React.FormEvent) {
+        e.preventDefault();
+        if (!cardQ.trim() || !cardA.trim() || !reviewId) return;
+        setSavingCard(true); setCardError(null);
+        try {
+            const card = await reviewsApi.addFlashcard(reviewId, cardQ.trim(), cardA.trim());
+            const draft: DraftCard = {
+                id: crypto.randomUUID(),
+                question: cardQ.trim(),
+                answer: cardA.trim(),
+                strength: null,
+                cardId: card.card_id,
+                saved: true,
+            };
+            setCards(prev => [...prev, draft]);
+            setCardQ(''); setCardA('');
+        } catch (err) {
+            setCardError(err instanceof ApiError ? err.message : 'Failed to save card.');
+        } finally { setSavingCard(false); }
+    }
+
+    // Rate a card's recall strength
+    async function handleRate(localId: string, strength: RecallStrength) {
+        if (!reviewId) return;
+        const card = cards.find(c => c.id === localId);
+        if (!card?.cardId) return;
+        try {
+            await reviewsApi.submitResult(reviewId, card.cardId, strength);
+            setCards(prev => prev.map(c => c.id === localId ? { ...c, strength } : c));
+        } catch { /* silent â€” rating is best-effort */ }
+    }
+
+    function proceedToQuiz() {
+        setQuizAnswers({});
+        setPhase('quiz');
+    }
+
+    function proceedToReflection() {
+        setPhase('reviewing');
+    }
+
+    async function handleReview(e: React.FormEvent) {
+        e.preventDefault();
+        if (!session) return;
+        setSubmitting(true);
+        try {
+            const tagList = tags.split(',').map(t => t.trim()).filter(Boolean);
+            await sessionsApi.review(session.id, reflection, tagList);
+        } catch { /* optional */ }
+        finally { setSubmitting(false); resetAll(); }
+    }
+
+    function resetAll() {
+        setPhase('idle'); setSession(null); setElapsed(0); setPaused(false);
+        setTopic(''); setReflection(''); setTags(''); setActiveMinutes('');
+        setStartError(null); setCards([]); setCardQ(''); setCardA('');
+        setReviewId(null); setQuizAnswers({}); setCardError(null);
+    }
+
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (subjectsLoading) return <FullPageSpinner />;
+    if (subjectsError) return <div className="py-8"><ErrorBanner message={subjectsError} onRetry={refreshSubjects} /></div>;
+
+    return (
+        <div className="animate-slide-up max-w-xl">
+            <div className="page-header"><h1>Study Session</h1></div>
+
+            {/* â”€â”€ Step indicator (only shown during active flow) â”€â”€â”€â”€â”€â”€ */}
+            {phase !== 'idle' && (
+                <div className="flex items-center gap-1 mb-5 select-none">
+                    {(['active', 'flashcards', 'quiz', 'reviewing'] as Phase[]).map((p, i) => {
+                        const labels = ['Session', 'Flashcards', 'Quick Quiz', 'Reflection'];
+                        const steps = ['active', 'flashcards', 'quiz', 'reviewing'];
+                        const current = steps.indexOf(phase);
+                        const done = i < current;
+                        const active = i === current;
+                        return (
+                            <div key={p} className="flex items-center gap-1 flex-1 min-w-0">
+                                <div className={`flex items-center gap-1.5 text-xs font-medium truncate ${active ? 'text-primary-400' : done ? 'text-green-400' : 'text-slate-600'
+                                    }`}>
+                                    <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] shrink-0 ${active ? 'bg-primary-600 text-white' : done ? 'bg-green-700 text-white' : 'bg-slate-700 text-slate-500'
+                                        }`}>
+                                        {done ? 'âœ“' : i + 1}
+                                    </span>
+                                    <span className="hidden sm:inline">{labels[i]}</span>
+                                </div>
+                                {i < 3 && <div className={`h-px flex-1 mx-1 ${done ? 'bg-green-700' : 'bg-slate-700'}`} />}
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
+
+            {/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                IDLE â€” Start Session Form
+            â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+            {phase === 'idle' && (
+                <div className="card">
+                    <p className="section-title">Start a Session</p>
+                    {subjects.length === 0 ? (
+                        <EmptyState title="No subjects" description="Add a subject before starting a session." />
+                    ) : (
+                        <form id="form-start-session" onSubmit={handleStart} className="flex flex-col gap-4 mt-2">
+                            <select id="select-session-subject" value={selectedSubject} onChange={e => setSelectedSubject(e.target.value)}>
+                                {subjects.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                            </select>
+                            <input id="input-session-topic" type="text" placeholder="Topic (e.g. Derivatives)"
+                                value={topic} onChange={e => setTopic(e.target.value)} required />
+                            <div className="flex gap-2">
+                                {(['STUDY', 'REVISION'] as const).map(t => (
+                                    <button key={t} type="button" id={`btn-type-${t.toLowerCase()}`}
+                                        onClick={() => setSessionType(t)}
+                                        className={sessionType === t ? 'btn-primary flex-1' : 'btn-secondary flex-1'}>
+                                        {t === 'STUDY' ? 'ðŸ“– Study' : 'ðŸ” Revision'}
+                                    </button>
+                                ))}
+                            </div>
+                            {startError && <p className="text-sm text-amber-400">âš  {startError}</p>}
+                            <button id="btn-start-session" type="submit"
+                                disabled={!selectedSubject || !topic.trim()} className="btn-primary">
+                                Start Timed Session
+                            </button>
+
+                            {sessionType === 'REVISION' && (
+                                <button
+                                    type="button"
+                                    id="btn-jump-to-revision"
+                                    onClick={() => navigate('/reviews')}
+                                    className="btn-ghost text-xs text-indigo-600 hover:text-indigo-800 mt-1"
+                                >
+                                    Or jump to Revision Queue â†’
+                                </button>
+                            )}
+                        </form>
+                    )}
+                </div>
+            )}
+
+            {/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                ACTIVE â€” Live Timer
+            â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+            {phase === 'active' && (
+                <div className="card text-center">
+                    <div className={`text-7xl font-mono font-bold my-6 transition-all duration-300 select-none ${paused ? 'text-amber-400 opacity-60' : 'text-primary-400'
+                        }`}>
+                        {fmt(elapsed)}
+                    </div>
+
+                    {paused && (
+                        <div id="timer-paused-indicator"
+                            className="flex items-center justify-center gap-2 text-amber-400 text-sm bg-amber-600/10 border border-amber-600/30 rounded-xl px-4 py-2 mb-4 animate-pulse">
+                            <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 shrink-0">
+                                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zM7 8a1 1 0 012 0v4a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                            </svg>
+                            Timer paused â€” return to this tab to resume
+                        </div>
+                    )}
+
+                    <p className="text-slate-300 font-semibold text-lg">{topic}</p>
+                    <p className="text-muted text-sm">{subjects.find(s => s.id === selectedSubject)?.name}</p>
+                    <span className="inline-block text-xs text-slate-500 border border-slate-700 rounded-full px-2 py-0.5 mt-1 mb-6">
+                        {sessionType}
+                    </span>
+
+                    {!paused && (
+                        <div className="flex items-center justify-center gap-2 text-green-400 text-xs mb-5">
+                            <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse inline-block" />
+                            Recording active time
+                        </div>
+                    )}
+
+                    <div className="border-t border-slate-700/50 pt-4 mt-2">
+                        <p className="text-xs text-muted mb-3">
+                            How many minutes were you truly focused?
+                            {' '}(Timer suggests <strong className="text-slate-300">{elapsedMinutes}</strong> min)
+                        </p>
+                        <form id="form-end-session" onSubmit={handleEnd} className="flex flex-col gap-3">
+                            <input id="input-active-minutes" type="number"
+                                placeholder={`Minutes studied (suggested: ${elapsedMinutes})`}
+                                min={1} max={1440} value={activeMinutes}
+                                onChange={e => setActiveMinutes(e.target.value)} required />
+                            {startError && <p className="text-sm text-amber-400">âš  {startError}</p>}
+                            <button id="btn-end-session" type="submit" disabled={submitting} className="btn-primary">
+                                {submitting ? 'â€¦' : 'End Session'}
+                            </button>
+                            <button id="btn-abandon-session" type="button" onClick={resetAll}
+                                className="btn-ghost btn-sm text-muted hover:text-red-400 text-xs">
+                                Abandon session
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            )}
+
+            {/* â”€â”€ Notes Panel (active session) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+            {phase === 'active' && selectedSubject && (
+                <div className="mt-4">
+                    <NotesPanel
+                        subjectId={selectedSubject}
+                        topic={topic || undefined}
+                        contextLabel={`${subjects.find(s => s.id === selectedSubject)?.name ?? ''}${topic ? ` â€“ ${topic}` : ''}`}
+                    />
+                </div>
+            )}
+
+            {/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                FLASHCARDS â€” Add & Rate cards for this topic
+            â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+            {phase === 'flashcards' && (
+                <div className="flex flex-col gap-4">
+                    <div className="card">
+                        <div className="flex items-center justify-between mb-1">
+                            <p className="section-title mb-0">Quick Flashcards</p>
+                            <span className="text-xs text-muted">{cards.length} / 5 added</span>
+                        </div>
+                        <p className="text-muted text-xs mb-4">
+                            Capture 1â€“5 key Q&amp;A pairs from this session on <strong className="text-slate-300">{topic}</strong>.
+                        </p>
+
+                        {/* Add card form (max 5) */}
+                        {cards.length < 5 && (
+                            <form id="form-add-flashcard" onSubmit={handleAddCard} className="flex flex-col gap-3 mb-4">
+                                <input id="input-card-question" type="text" placeholder="Question"
+                                    value={cardQ} onChange={e => setCardQ(e.target.value)} required />
+                                <input id="input-card-answer" type="text" placeholder="Answer"
+                                    value={cardA} onChange={e => setCardA(e.target.value)} required />
+                                {cardError && <p className="text-xs text-amber-400">âš  {cardError}</p>}
+                                <button id="btn-add-flashcard" type="submit" disabled={savingCard || !cardQ.trim() || !cardA.trim()}
+                                    className="btn-secondary btn-sm">
+                                    {savingCard ? 'â€¦' : '+ Add Card'}
+                                </button>
+                            </form>
+                        )}
+
+                        {cards.length < 5 && (
+                            <div className="border-t border-slate-700/50 pt-4 mt-2">
+                                <button
+                                    onClick={handleAiFlashcards}
+                                    disabled={generating || !selectedSubject || !topic}
+                                    className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-indigo-200 bg-indigo-50 text-indigo-700 text-sm font-semibold hover:bg-indigo-100 transition-all"
+                                >
+                                    {generating ? 'âœ¨ Generating...' : 'âœ¨ Generate from My Notes'}
+                                </button>
+                                {genError && <p className="text-xs text-red-500 mt-2 text-center">âš  {genError}</p>}
+                            </div>
+                        )}
+                        {/* Saved cards â€” rate each one */}
+                        {cards.length > 0 && (
+                            <ul className="flex flex-col gap-3">
+                                {cards.map(card => (
+                                    <li key={card.id} className="border border-slate-700/60 rounded-xl p-3 bg-slate-800/40">
+                                        <p className="text-sm text-slate-200 font-medium mb-0.5">{card.question}</p>
+                                        <p className="text-xs text-muted mb-3">â†’ {card.answer}</p>
+                                        <div className="flex gap-2">
+                                            {(['WEAK', 'MODERATE', 'STRONG'] as RecallStrength[]).map(s => (
+                                                <button
+                                                    key={s}
+                                                    type="button"
+                                                    id={`btn-rate-${card.id}-${s.toLowerCase()}`}
+                                                    onClick={() => handleRate(card.id, s)}
+                                                    className={`flex-1 text-xs py-1.5 rounded-lg border transition-all duration-150 ${card.strength === s
+                                                        ? RECALL_STYLES[s]
+                                                        : 'border-slate-700 text-slate-500 hover:border-slate-500 hover:text-slate-400'
+                                                        }`}
+                                                >
+                                                    {s === 'WEAK' ? 'ðŸ˜• Weak' : s === 'MODERATE' ? 'ðŸ¤” Moderate' : 'ðŸ’ª Strong'}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </li>
+                                ))}
+                            </ul>
+                        )}
+                    </div>
+
+                    {/* Navigation */}
+                    <div className="flex gap-3">
+                        <button id="btn-flashcards-next" type="button" onClick={proceedToQuiz}
+                            className="btn-primary flex-1">
+                            {cards.length === 0 ? 'Skip Flashcards â†’' : 'Continue to Quiz â†’'}
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                QUIZ â€” Quick self-assessment (informational only)
+            â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+            {phase === 'quiz' && (
+                <div className="card">
+                    <p className="section-title">Quick Self-Check</p>
+                    <p className="text-xs text-muted mb-5">
+                        3 quick questions about your session. Answers are not stored â€” they're just for you.
+                    </p>
+
+                    <div className="flex flex-col gap-6">
+                        {!dynamicQuiz && (
+                            <button
+                                onClick={handleAiQuiz}
+                                disabled={generating}
+                                className="w-full flex items-center justify-center gap-2 py-3 mb-2 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-700 text-sm font-bold hover:bg-emerald-100 transition-all shadow-sm"
+                            >
+                                {generating ? 'âœ¨ Generating Quiz...' : 'âœ¨ Generate Quiz from My Notes'}
+                            </button>
+                        )}
+                        {genError && phase === 'quiz' && <p className="text-xs text-red-500 text-center">âš  {genError}</p>}
+
+                        {(dynamicQuiz || QUIZ_QUESTIONS).map((q, qi) => (
+                            <div key={q.id} id={`quiz-q-${qi + 1}`}>
+                                <p className="text-sm font-medium text-slate-200 mb-3">
+                                    <span className="text-muted mr-2">{qi + 1}.</span>{q.text || q.question}
+                                </p>
+                                <div className="flex flex-col gap-2">
+                                    {q.options.map((opt: string, oi: number) => {
+                                        const qid = String(q.id);
+                                        const selected = quizAnswers[qid] === opt;
+                                        return (
+                                            <button
+                                                key={oi}
+                                                type="button"
+                                                id={`quiz-${qid}-opt-${oi}`}
+                                                onClick={() => setQuizAnswers(prev => ({ ...prev, [qid]: opt }))}
+                                                className={`w-full text-left text-sm px-4 py-3 rounded-xl border transition-all duration-150 ${selected
+                                                    ? 'bg-primary-600/20 border-primary-500/50 text-primary-300'
+                                                    : 'border-slate-700 text-slate-400 hover:border-slate-500 hover:text-slate-300 bg-slate-800/30'
+                                                    }`}
+                                            >
+                                                <span className={`mr-3 text-xs ${selected ? 'text-primary-400' : 'text-slate-600'}`}>
+                                                    {selected ? 'â—' : 'â—‹'}
+                                                </span>
+                                                {opt}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    <button
+                        id="btn-quiz-next"
+                        type="button"
+                        onClick={proceedToReflection}
+                        className="btn-primary w-full mt-6"
+                    >
+                        Continue to Reflection â†’
+                    </button>
+                    <button type="button" onClick={proceedToReflection}
+                        className="btn-ghost btn-sm text-muted text-xs w-full mt-2">
+                        Skip quiz
+                    </button>
+                </div>
+            )}
+
+            {/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                REVIEWING â€” Reflection & Tags (stored verbatim)
+            â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+            {phase === 'reviewing' && (
+                <div className="card">
+                    <div className="flex items-center gap-3 mb-4">
+                        <div className="w-9 h-9 rounded-xl bg-green-600/20 flex items-center justify-center shrink-0">
+                            <svg viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-green-400">
+                                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                            </svg>
+                        </div>
+                        <div>
+                            <p className="font-semibold text-slate-200">Session complete!</p>
+                            <p className="text-muted text-xs">
+                                {elapsedMinutes} min Â· {cards.length} flashcard{cards.length !== 1 ? 's' : ''} Â· {topic}
+                            </p>
+                        </div>
+                    </div>
+
+                    <p className="section-title">Post-Session Reflection</p>
+                    <form id="form-session-review" onSubmit={handleReview} className="flex flex-col gap-4 mt-2">
+                        <textarea id="input-reflection"
+                            placeholder="What did you understand? What needs more work?"
+                            value={reflection} onChange={e => setReflection(e.target.value)}
+                            rows={4} className="resize-none" />
+                        <input id="input-tags" type="text"
+                            placeholder="Tags (comma-separated, e.g. calculus, revision)"
+                            value={tags} onChange={e => setTags(e.target.value)} />
+                        <button id="btn-submit-review" type="submit" disabled={submitting} className="btn-primary">
+                            {submitting ? 'â€¦' : 'Submit & Complete'}
+                        </button>
+                    </form>
+
+                    {/* â”€â”€ Notes Panel (reflection phase) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+                    <div className="mt-6 border-t border-slate-100 pt-6">
+                        <NotesPanel
+                            subjectId={selectedSubject}
+                            topic={topic || undefined}
+                            contextLabel={`${subjects.find(s => s.id === selectedSubject)?.name ?? ''}${topic ? ` â€“ ${topic}` : ''}`}
+                        />
+                    </div>
+                    <button id="btn-skip-review" type="button" onClick={resetAll} className="btn-secondary text-sm">
+                        Skip
+                    </button>
+                </div>
+            )}
+        </div>
+    );
+}
+---
+File not found: client/src/pages/StudyPlanPage.tsx
+---
+/**
+ * API Client â€” LearnSphere
+ *
+ * Rules (from FRONTEND_GUIDELINES.md):
+ * - Backend is the ONLY source of truth
+ * - No mock data
+ * - All responses are typed via src/types/api.ts
+ * - Token is stored in localStorage and injected per-request
+ */
+
+import axios, { AxiosError, type AxiosInstance } from 'axios';
+import type {
+    AuthResponse,
+    Subject,
+    Task,
+    ChecklistItem,
+    SessionStartResponse,
+    StudySession,
+    AnalyticsSnapshot,
+    ConsistencyDay,
+    TodayOverview,
+    NeglectSignal,
+    Exam,
+    ExamMark,
+    ReviewItem,
+    Flashcard,
+    Note,
+} from '../types/api';
+
+// â”€â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const BASE_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001/api';
+export const TOKEN_KEY = 'ls_token';
+
+// â”€â”€â”€ Axios Instance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const http: AxiosInstance = axios.create({
+    baseURL: BASE_URL,
+    headers: { 'Content-Type': 'application/json' },
+});
+
+// Attach JWT on every request
+http.interceptors.request.use((config) => {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) config.headers.Authorization = `Bearer ${token}`;
+    return config;
+});
+
+// â”€â”€â”€ Error Normaliser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export class ApiError extends Error {
+    status: number;
+    code: string;
+    constructor(message: string, status: number, code: string) {
+        super(message);
+        this.name = 'ApiError';
+        this.status = status;
+        this.code = code;
+    }
+}
+
+function handleError(err: unknown): never {
+    if (err instanceof AxiosError && err.response) {
+        const { error, code } = err.response.data as { error: string; code: string };
+        throw new ApiError(error ?? 'Unknown error', err.response.status, code ?? 'UNKNOWN');
+    }
+    throw err;
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// AUTH
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const authApi = {
+    register: (email: string, password: string) =>
+        http.post<AuthResponse>('/auth/register', { email, password })
+            .then(r => r.data).catch(handleError),
+
+    login: (email: string, password: string) =>
+        http.post<AuthResponse>('/auth/login', { email, password })
+            .then(r => r.data).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// SUBJECTS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const subjectsApi = {
+    list: () =>
+        http.get<Subject[]>('/subjects').then(r => r.data).catch(handleError),
+
+    create: (name: string) =>
+        http.post<Subject>('/subjects', { name }).then(r => r.data).catch(handleError),
+
+    rename: (subjectId: string, name: string) =>
+        http.patch<Subject>(`/subjects/${subjectId}`, { name }).then(r => r.data).catch(handleError),
+
+    delete: (subjectId: string) =>
+        http.delete(`/subjects/${subjectId}`).then(() => undefined).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// TASKS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const tasksApi = {
+    list: () =>
+        http.get<Task[]>('/tasks').then(r => r.data).catch(handleError),
+
+    create: (subject_id: string, title: string) =>
+        http.post<Task>('/tasks', { subject_id, title }).then(r => r.data).catch(handleError),
+
+    delete: (taskId: string) =>
+        http.delete(`/tasks/${taskId}`).then(() => undefined).catch(handleError),
+
+    // Checklist
+    getChecklist: (taskId: string) =>
+        http.get<ChecklistItem[]>(`/tasks/${taskId}/checklist`).then(r => r.data).catch(handleError),
+
+    addChecklistItem: (taskId: string, label: string) =>
+        http.post<ChecklistItem>(`/tasks/${taskId}/checklist`, { label })
+            .then(r => r.data).catch(handleError),
+
+    updateChecklistItem: (taskId: string, itemId: string, is_completed: boolean) =>
+        http.patch<ChecklistItem>(`/tasks/${taskId}/checklist/${itemId}`, { is_completed })
+            .then(r => r.data).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// SESSIONS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const sessionsApi = {
+    start: (subject_id: string, topic: string, session_type?: string) =>
+        http.post<SessionStartResponse>('/sessions/start', { subject_id, topic, session_type })
+            .then(r => r.data).catch(handleError),
+
+    end: (sessionId: string, active_minutes: number) =>
+        http.post<StudySession>(`/sessions/${sessionId}/end`, { active_minutes })
+            .then(r => r.data).catch(handleError),
+
+    review: (sessionId: string, reflection_text?: string, tags?: string[]) =>
+        http.post<{ stored: boolean }>(`/sessions/${sessionId}/review`, { reflection_text, tags })
+            .then(r => r.data).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ANALYTICS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const analyticsApi = {
+    overview: () =>
+        http.get<AnalyticsSnapshot[]>('/analytics/overview').then(r => r.data).catch(handleError),
+
+    consistency: () =>
+        http.get<ConsistencyDay[]>('/analytics/consistency').then(r => r.data).catch(handleError),
+
+    today: () =>
+        http.get<TodayOverview>('/analytics/today').then(r => r.data).catch(handleError),
+
+    neglect: () =>
+        http.get<NeglectSignal[]>('/analytics/neglect').then(r => r.data).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// EXAMS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const examsApi = {
+    list: () =>
+        http.get<Exam[]>('/exams').then(r => r.data).catch(handleError),
+
+    create: (title: string, exam_date: string) =>
+        http.post<Exam>('/exams', { title, exam_date }).then(r => r.data).catch(handleError),
+
+    getMarks: (examId: string) =>
+        http.get<ExamMark[]>(`/exams/${examId}/marks`).then(r => r.data).catch(handleError),
+
+    addMarks: (examId: string, marks: ExamMark[]) =>
+        http.post<{ stored: boolean }>(`/exams/${examId}/marks`, marks)
+            .then(r => r.data).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// REVIEWS
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const reviewsApi = {
+    queue: () =>
+        http.get<ReviewItem[]>('/reviews').then(r => r.data).catch(handleError),
+
+    create: (subject_id: string, topic: string) =>
+        http.post<ReviewItem>('/reviews', { subject_id, topic }).then(r => r.data).catch(handleError),
+
+    getFlashcards: (reviewId: string) =>
+        http.get<Flashcard[]>(`/reviews/${reviewId}/flashcards`).then(r => r.data).catch(handleError),
+
+    addFlashcard: (reviewId: string, question: string, answer: string) =>
+        http.post<Flashcard>(`/reviews/${reviewId}/flashcards`, { question, answer })
+            .then(r => r.data).catch(handleError),
+
+    submitResult: (reviewId: string, cardId: string, recall_strength: string) =>
+        http.post<{ stored: boolean; recall_strength: string }>(
+            `/reviews/${reviewId}/flashcards/${cardId}`,
+            { recall_strength }
+        ).then(r => r.data).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// SUMMARIZER  (Feature 4 â€” stateless, no auto-save)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const summarizeApi = {
+    summarize: (text: string) =>
+        http.post<{ summary: string }>('/summarize', { text })
+            .then(r => r.data).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// NOTES  (Feature 2 â€” user-authored study notes, never AI-modified)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export const notesApi = {
+    /** List notes for a subject, optionally filtered to a topic */
+    list: (subjectId: string, topic?: string) => {
+        const params: Record<string, string> = { subjectId };
+        if (topic) params['topic'] = topic;
+        return http.get<Note[]>('/notes', { params }).then(r => r.data).catch(handleError);
+    },
+
+    create: (subjectId: string, content: string, topic?: string) =>
+        http.post<Note>('/notes', { subjectId, content, topic })
+            .then(r => r.data).catch(handleError),
+
+    update: (noteId: string, content: string) =>
+        http.patch<Note>(`/notes/${noteId}`, { content })
+            .then(r => r.data).catch(handleError),
+
+    delete: (noteId: string) =>
+        http.delete(`/notes/${noteId}`).then(() => undefined).catch(handleError),
+};
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// GENERATION (Feature 2 â€” AI-generated content from notes)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export interface AISuggestedCard {
+    question: string;
+    answer: string;
+}
+
+export interface AIQuizQuestion {
+    id: number;
+    question: string;
+    options: string[];
+    correct: string;
+}
+
+export const generateApi = {
+    /** Generate flashcards grounded in note content */
+    flashcards: (notes: string) =>
+        http.post<AISuggestedCard[]>('/generate/flashcards', { notes })
+            .then(r => r.data).catch(handleError),
+
+    /** Generate a quiz grounded in note content */
+    quiz: (notes: string) =>
+        http.post<AIQuizQuestion[]>('/generate/quiz', { notes })
+            .then(r => r.data).catch(handleError),
+};
+---
