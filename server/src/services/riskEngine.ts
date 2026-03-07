@@ -328,7 +328,7 @@ async function buildAIExplanation(params: {
     try {
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({
-            model: 'gemini-1.5-flash',
+            model: 'gemini-2.0-flash',
             systemInstruction: 'You are an academic risk analyst. ONLY reference data provided to you — no invented context. Return valid JSON only.',
             generationConfig: {
                 temperature: 0.1,
