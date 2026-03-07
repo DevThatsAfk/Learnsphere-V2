@@ -39,7 +39,7 @@ const PORT = parseInt(process.env.PORT ?? '3001', 10);
 // ─────────────────────────────────────────────────
 const io = new SocketServer(httpServer, {
     cors: {
-        origin: process.env.FRONTEND_URL ?? 'http://localhost:5173',
+        origin: process.env.CLIENT_URL ?? process.env.FRONTEND_URL ?? 'http://localhost:5173',
         credentials: true,
     },
 });
@@ -49,7 +49,7 @@ initChatSocket(io);
 // MIDDLEWARE
 // ─────────────────────────────────────────────────
 app.use(cors({
-    origin: process.env.FRONTEND_URL ?? 'http://localhost:5173',
+    origin: process.env.CLIENT_URL ?? process.env.FRONTEND_URL ?? 'http://localhost:5173',
     credentials: true,
 }));
 app.use(express.json());
