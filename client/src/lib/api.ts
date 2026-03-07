@@ -62,9 +62,18 @@ export class ApiError extends Error {
 }
 
 function handleError(err: unknown): never {
-    if (err instanceof AxiosError && err.response) {
-        const { error, code } = err.response.data as { error: string; code: string };
-        throw new ApiError(error ?? 'Unknown error', err.response.status, code ?? 'UNKNOWN');
+    if (err instanceof AxiosError) {
+        if (err.response) {
+            // Server responded with a non-2xx status
+            const { error, code } = err.response.data as { error: string; code: string };
+            throw new ApiError(error ?? 'Unknown error', err.response.status, code ?? 'UNKNOWN');
+        }
+        // No response — network error or CORS block
+        throw new ApiError(
+            'Cannot reach the server. Please check your connection or try again.',
+            0,
+            'NETWORK_ERROR'
+        );
     }
     throw err;
 }
