@@ -32,7 +32,7 @@ import chatRouter from './routes/chat';
 
 const app = express();
 const httpServer = http.createServer(app);
-const PORT = parseInt(process.env.PORT ?? '3001', 10);
+const PORT = parseInt(process.env.PORT ?? '8080', 10);
 
 // ─────────────────────────────────────────────────
 // SOCKET.IO — v2 WebSocket for chat
@@ -97,7 +97,7 @@ app.use(errorHandler);
 // ─────────────────────────────────────────────────
 // START SERVER (using httpServer for Socket.io)
 // ─────────────────────────────────────────────────
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[LearnSphere API] Server running on http://localhost:${PORT}`);
     console.log(`[LearnSphere API] Health: http://localhost:${PORT}/health`);
     console.log(`[LearnSphere API] Environment: ${process.env.NODE_ENV ?? 'development'}`);

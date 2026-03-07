@@ -16,8 +16,4 @@ export const aiRateLimit = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many AI requests. Please wait 15 minutes before trying again.', code: 'RATE_LIMITED' },
-    keyGenerator: (req) => {
-        // After authenticateToken, userId is guaranteed to be set
-        return (req as AuthenticatedRequest).userId ?? req.ip ?? 'anonymous';
-    },
 });
