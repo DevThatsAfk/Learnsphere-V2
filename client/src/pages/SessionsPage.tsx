@@ -7,7 +7,7 @@ import { FullPageSpinner, ErrorBanner, EmptyState } from '../components/ui';
 import { NotesPanel } from '../components/NotesPanel';
 
 // ─── Types ────────────────────────────────────────────────────────
-type Phase = 'idle' | 'active' | 'flashcards' | 'quiz' | 'reviewing';
+type Phase = 'idle' | 'active' | 'debrief' | 'flashcards' | 'quiz' | 'reviewing';
 
 interface DraftCard {
     id: string;          // temp local id
@@ -128,21 +128,33 @@ export function SessionsPage() {
     const [genError, setGenError] = useState<string | null>(null);
     const [dynamicQuiz, setDynamicQuiz] = useState<AIQuizQuestion[] | null>(null);
 
+    // Live notes text from NotesPanel — updated on every keystroke via onNotesChange callback
+    const liveNotesRef = useRef<string>('');
+
     async function handleAiFlashcards() {
-        // Bug 6 fix: this must only be called in the flashcards phase
-        // where reviewId is guaranteed to be set. session.id is a StudySession ID,
-        // not a ReviewItem ID — passing it to addFlashcard caused a 404.
         if (!selectedSubject || !reviewId) return;
         setGenerating(true); setGenError(null);
         try {
-            const list = await notesApi.list(selectedSubject, topic);
-            const notesText = list.map(n => n.content).join('\n\n');
-            if (!notesText || notesText.length < 50) {
+            // 1: Use live notes the user has typed (instant, no save required)
+            let notesText = liveNotesRef.current.trim();
+
+            // 2: Fallback — fetch from API (covers previously saved notes)
+            if (notesText.length < 50) {
+                const list = await notesApi.list(selectedSubject, topic);
+                notesText = list.map(n => n.content).join('\n\n').trim();
+            }
+
+            // 3: If still too short, load ALL notes for subject regardless of topic
+            if (notesText.length < 50) {
+                const allList = await notesApi.list(selectedSubject);
+                notesText = allList.map(n => n.content).join('\n\n').trim();
+            }
+
+            if (notesText.length < 50) {
                 setGenError('Write at least 50 chars in "My Notes" first to generate cards.');
                 return;
             }
             const suggested = await generateApi.flashcards(notesText);
-            // Add AI-suggested cards using the correct ReviewItem ID (reviewId)
             for (const s of suggested) {
                 if (cards.length >= 5) break;
                 const card = await reviewsApi.addFlashcard(reviewId, s.question, s.answer);
@@ -166,9 +178,19 @@ export function SessionsPage() {
         if (!selectedSubject) return;
         setGenerating(true); setGenError(null);
         try {
-            const list = await notesApi.list(selectedSubject, topic);
-            const notesText = list.map(n => n.content).join('\n\n');
-            if (!notesText || notesText.length < 50) {
+            // 1: Use live notes first
+            let notesText = liveNotesRef.current.trim();
+            // 2: Fallback to saved notes for this topic
+            if (notesText.length < 50) {
+                const list = await notesApi.list(selectedSubject, topic);
+                notesText = list.map(n => n.content).join('\n\n').trim();
+            }
+            // 3: Fallback to all notes for subject
+            if (notesText.length < 50) {
+                const allList = await notesApi.list(selectedSubject);
+                notesText = allList.map(n => n.content).join('\n\n').trim();
+            }
+            if (notesText.length < 50) {
                 setGenError('Write at least 50 chars in "My Notes" first.');
                 return;
             }
@@ -216,14 +238,31 @@ export function SessionsPage() {
         setSubmitting(true);
         try {
             await sessionsApi.end(session.id, mins);
-            // Initialise the review item for flashcard phase
+            // Bug 6 fix: show debrief choice screen before starting flashcards
+            setPhase('debrief');
+        } catch (err) {
+            setStartError(err instanceof ApiError ? err.message : 'Failed to end session.');
+        } finally { setSubmitting(false); }
+    }
+
+    // Bug 6 fix: user chose to start debrief — create ReviewItem then go to flashcards
+    async function handleStartDebrief() {
+        if (!session) return;
+        setSubmitting(true);
+        try {
             const rev = await reviewsApi.create(selectedSubject, topic.trim());
             setReviewId(rev.review_id);
             setCards([]);
             setPhase('flashcards');
-        } catch (err) {
-            setStartError(err instanceof ApiError ? err.message : 'Failed to end session.');
+        } catch {
+            // If review creation fails, still let them reflect
+            setPhase('reviewing');
         } finally { setSubmitting(false); }
+    }
+
+    // Bug 6 fix: user chose to skip debrief — go straight to reflection
+    function handleSkipDebrief() {
+        setPhase('reviewing');
     }
 
     // Add a flashcard: save to backend immediately, then allow recall rating
@@ -354,7 +393,7 @@ export function SessionsPage() {
                                 <button
                                     type="button"
                                     id="btn-jump-to-revision"
-                                    onClick={() => navigate('/reviews')}
+                                    onClick={() => navigate('/reviews', { state: { subjectId: selectedSubject } })}
                                     className="btn-ghost text-xs text-indigo-600 hover:text-indigo-800 mt-1"
                                 >
                                     Or jump to Revision Queue →
@@ -428,9 +467,45 @@ export function SessionsPage() {
                         subjectId={selectedSubject}
                         topic={topic || undefined}
                         contextLabel={`${subjects.find(s => s.id === selectedSubject)?.name ?? ''}${topic ? ` – ${topic}` : ''}`}
+                        onNotesChange={(text) => { liveNotesRef.current = text; }}
                     />
                 </div>
             )}
+
+            {/* ─────────────────────────────────────────────────────
+                DEBRIEF — Choice screen after session ends (Bug 6 fix)
+            ───────────────────────────────────────────────────── */}
+            {phase === 'debrief' && (
+                <div className="card text-center animate-slide-up">
+                    <div className="text-4xl mb-4">🎯</div>
+                    <h2 className="text-xl font-bold text-slate-100 mb-2">Session Complete!</h2>
+                    <p className="text-muted text-sm mb-6">
+                        Great work on <strong className="text-slate-300">{topic}</strong>.<br />
+                        Would you like to consolidate what you learned?
+                    </p>
+                    <div className="flex flex-col gap-3">
+                        <button
+                            id="btn-start-debrief"
+                            onClick={handleStartDebrief}
+                            disabled={submitting}
+                            className="btn-primary"
+                        >
+                            {submitting ? '…' : '🧠 Start Debrief — AI Flashcards + Quiz'}
+                        </button>
+                        <p className="text-xs text-muted">
+                            Uses your notes from this session to auto-generate revision material
+                        </p>
+                        <button
+                            id="btn-skip-debrief"
+                            onClick={handleSkipDebrief}
+                            className="btn-ghost text-sm text-muted hover:text-slate-300"
+                        >
+                            Skip → Go to Reflection
+                        </button>
+                    </div>
+                </div>
+            )}
+
 
             {/* ─────────────────────────────────────────────────────
                 FLASHCARDS — Add & Rate cards for this topic
@@ -465,7 +540,7 @@ export function SessionsPage() {
                             <div className="border-t border-slate-700/50 pt-4 mt-2">
                                 <button
                                     onClick={handleAiFlashcards}
-                                    disabled={generating || !selectedSubject || !topic}
+                                    disabled={generating || !selectedSubject}
                                     className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-indigo-200 bg-indigo-50 text-indigo-700 text-sm font-semibold hover:bg-indigo-100 transition-all"
                                 >
                                     {generating ? '✨ Generating...' : '✨ Generate from My Notes'}
@@ -477,9 +552,9 @@ export function SessionsPage() {
                         {cards.length > 0 && (
                             <ul className="flex flex-col gap-3">
                                 {cards.map(card => (
-                                    <li key={card.id} className="border border-slate-700/60 rounded-xl p-3 bg-slate-800/40">
-                                        <p className="text-sm text-slate-200 font-medium mb-0.5">{card.question}</p>
-                                        <p className="text-xs text-muted mb-3">→ {card.answer}</p>
+                                    <li key={card.id} className="border border-indigo-100 rounded-xl p-4 bg-white shadow-sm border-l-4 border-l-indigo-400">
+                                        <p className="text-sm font-semibold text-slate-800 mb-1">❓ {card.question}</p>
+                                        <p className="text-sm text-indigo-700 mb-3">→ {card.answer}</p>
                                         <div className="flex gap-2">
                                             {(['WEAK', 'MODERATE', 'STRONG'] as RecallStrength[]).map(s => (
                                                 <button
@@ -489,7 +564,7 @@ export function SessionsPage() {
                                                     onClick={() => handleRate(card.id, s)}
                                                     className={`flex-1 text-xs py-1.5 rounded-lg border transition-all duration-150 ${card.strength === s
                                                         ? RECALL_STYLES[s]
-                                                        : 'border-slate-700 text-slate-500 hover:border-slate-500 hover:text-slate-400'
+                                                        : 'border-slate-200 text-slate-500 hover:border-indigo-300 hover:text-indigo-600'
                                                         }`}
                                                 >
                                                     {s === 'WEAK' ? '😕 Weak' : s === 'MODERATE' ? '🤔 Moderate' : '💪 Strong'}

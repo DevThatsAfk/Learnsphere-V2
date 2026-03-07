@@ -1,0 +1,975 @@
+LearnSphere
+v1 → v2 Technical Handover Document
+Complete specification for a new developer or AI builder to implement v2 from scratch
+
+1. Project Overview
+LearnSphere is a full-stack AI-powered academic intelligence platform. It was initially built as a personal study assistant (v1) and is being extended into an institutional at-risk student detection and intervention system (v2).
+
+Property
+Value
+Project Name
+LearnSphere
+Current Version
+v1 (stable, deployed)
+Target Version
+v2 (to be built)
+Problem Statement
+SDG 4 — Quality Education, CIT Chennai hackathon
+Primary Stack
+React + TypeScript (frontend), Node/Express + TypeScript (backend)
+Database
+PostgreSQL via Prisma ORM
+AI Model
+Google Gemini 1.5 Flash (free tier, multimodal)
+Authentication
+JWT-based, stored in localStorage
+Deployment Target
+Local dev + Vercel/Railway for demo
+
+2. v1 Codebase — What Exists Today
+The following features are fully built and working in v1. Do NOT remove or break any of these when building v2.
+
+2.1 Backend — Server (Node/Express/TypeScript)
+File / Route
+What it does
+server/src/routes/auth.ts
+POST /api/auth/register, POST /api/auth/login — JWT auth
+server/src/routes/subjects.ts
+CRUD for Subject model — list, create, rename, delete
+server/src/routes/tasks.ts
+Task management with checklist items per task
+server/src/routes/sessions.ts
+Study session start/end/review with timer
+server/src/routes/reviews.ts
+Revision queue management — ReviewItem + Flashcard
+server/src/routes/notes.ts
+User-authored study notes per subject/topic
+server/src/routes/summarize.ts
+POST /api/summarize — Gemini text summariser
+server/src/routes/generate.ts
+POST /api/generate/flashcards and /quiz from text
+server/src/routes/analytics.ts
+Dashboard analytics — overview, consistency, neglect signals
+server/src/routes/exams.ts
+Exam creation + mark recording per subject
+server/src/services/reviewService.ts
+SRS logic — recall strength aggregation at ReviewItem level
+server/src/services/analyticsService.ts
+AnalyticsSnapshot cached view
+server/src/services/generatorService.ts
+Gemini flashcard + quiz generation from text
+server/src/middleware/auth.ts
+JWT validation — CAUTION: DEV_BYPASS_AUTH bug exists
+server/src/middleware/errorHandler.ts
+asyncHandler + ApiError class
+server/src/prisma/client.ts
+Prisma singleton
+
+2.2 Frontend — Client (React/TypeScript/Vite)
+File
+What it does
+client/src/pages/DashboardPage.tsx
+Main dashboard — analytics overview + today stats
+client/src/pages/SessionsPage.tsx
+Study session flow: idle → active → flashcards → quiz → reflection
+client/src/pages/ReviewsPage.tsx
+Revision queue — grouped by subject, card-by-card practice
+client/src/pages/SmartNotesPage.tsx
+AI notes booster — summarise/topics/exam focus + file upload (.txt/.md)
+client/src/pages/TasksPage.tsx
+Task management with checklist items
+client/src/pages/ExamsPage.tsx
+Exam tracking and mark entry
+client/src/pages/StudyPlanPage.tsx
+LISTED AS BUILT — file not found in codebase dump (must be created)
+client/src/components/NotesPanel.tsx
+Inline notes panel used in Sessions + Reviews pages
+client/src/components/ui.tsx
+Shared UI: FullPageSpinner, ErrorBanner, EmptyState, SkeletonRow
+client/src/context/SubjectsContext.tsx
+Global subjects state — avoids prop drilling
+client/src/lib/api.ts
+All API calls — authApi, subjectsApi, sessionsApi, reviewsApi, generateApi, etc.
+client/src/types/api.ts
+TypeScript interfaces for all API response shapes
+
+2.3 Database Schema — v1 Models
+Model
+Purpose
+User
+Authentication — email, passwordHash, name
+Subject
+Academic subject — userId FK, name
+Task
+To-do item — subjectId FK, title, isCompleted
+ChecklistItem
+Sub-item under Task
+StudySession
+Timed session — subjectId, topic, sessionType, activeMinutes, startedAt, endedAt
+SessionReview
+Post-session reflection + tags
+ReviewItem
+SRS topic — subjectId, topic, recallStrength (WEAK/MODERATE/STRONG)
+Flashcard
+Q&A card — reviewItemId, question, answer
+Note
+Study note — subjectId, topic, content
+Exam
+Exam record — userId, title, examDate
+ExamMark
+Mark per subject — examId, subjectId, marksObtained, maxMarks
+AnalyticsSnapshot
+Cached analytics view — updated after session events
+
+3. Known Bugs in v1 — Fix These First
+CRITICAL: These bugs must be fixed BEFORE building any v2 features. Fix them in order.
+
+Priority
+Bug
+Fix
+CRITICAL
+dynamicQuiz typed as any[] in SessionsPage.tsx
+Change useState<any[] | null>(null) to useState<AIQuizQuestion[] | null>(null). Import AIQuizQuestion from ../lib/api.
+CRITICAL
+No rate limiting on AI routes
+Install express-rate-limit. Add 20 req/15min limit to /api/generate/* and /api/summarize. Prevents quota exhaustion mid-demo.
+HIGH
+DEV_BYPASS_AUTH unguarded
+In server/src/middleware/auth.ts, add: if (process.env.NODE_ENV === "production" && bypassAuth) throw new Error("Cannot use DEV_BYPASS in production")
+HIGH
+NotesPanel has no max-height
+Add max-h-96 overflow-y-auto to the textarea/list container in NotesPanel.tsx. Prevents layout explosion during demo.
+HIGH
+"Jump to Revision" loses subject context
+In SessionsPage.tsx, the btn-jump-to-revision button calls navigate("/reviews") with no state. Fix: navigate("/reviews", { state: { subjectId: selectedSubject } }) and read it in ReviewsPage.tsx useEffect.
+MEDIUM
+Post-session debrief not built
+After End Session, student should see a choice screen: "Start Debrief (AI Quiz + Flashcards)" or "Skip". The debrief uses notes from the session to auto-generate content. This was promised in the v1 file upload feature set.
+MEDIUM
+StudyPlanPage.tsx missing
+The page is referenced in routing but the file does not exist. Must be created. See Section 8 for spec.
+LOW
+RecallStrength at ReviewItem level
+The deficiency report flagged this as a core architectural flaw. RecallStrength should be per Flashcard, not per ReviewItem. Defer to Phase 6 — schema migration required.
+
+4. v2 Architecture Overview
+v2 adds an institutional intelligence layer on top of v1. All v1 features remain unchanged. v2 adds risk scoring, intervention pipelines, and 5 new role-based dashboards.
+
+4.1 System Architecture
+Data Layer (Student activity + LMS ingestion + Attendance) → Risk Score Engine (Rule layer + AI explanation) → Alert & Triage System → Intervention Pipeline (Educator → HoD → Student) → Outcome Tracking (7-day follow-up)
+
+4.2 Six User Roles
+Role
+Scope
+Key Power
+STUDENT
+Themselves only
+Learn, track progress, receive interventions, see own risk score
+PARENT
+Their 2 children max (read-only)
+View child risk/attendance/marks, receive RED+AMBER alerts, chat with educators
+EDUCATOR
+Their subject's students
+Create intervention plans, view student risk per subject
+ADVISOR
+Assigned students only
+Log counselling notes, track intervention outcomes, full student view
+HOD
+Full department
+Risk heatmap, NAAC reports, educator oversight, set risk thresholds, approve RED interventions
+ADMIN
+Entire institution
+All user management, bulk CSV import, LMS config, audit logs, system health
+
+4.3 Intervention Approval Flow
+This is the exact sequence for a RED-level student. No shortcuts.
+AI risk engine detects student hits RED (score > 60)
+Educator creates intervention plan (can use AI suggestion as draft)
+HoD reviews — approves or modifies the plan
+Plan sent to student dashboard
+Parent receives alert (in-app + email via nodemailer)
+Advisor logs counselling notes if meeting occurs
+7 days later: cron job recalculates risk score, logs outcome delta
+
+4.4 Login Flow
+Single login page at /login. Role selector dropdown (STUDENT / PARENT / EDUCATOR / ADVISOR / HOD / ADMIN). JWT returned from server contains { userId, role, email }. RoleRouter.tsx reads role and redirects to the correct portal on login.
+Role
+Redirect after login
+STUDENT
+/dashboard (existing v1 dashboard)
+PARENT
+/parent/dashboard
+EDUCATOR
+/sessions (existing v1 sessions page)
+ADVISOR
+/advisor/dashboard
+HOD
+/hod/dashboard
+ADMIN
+/admin/dashboard
+
+5. v2 Database Schema — New Models
+Add all of these to prisma/schema.prisma. Run: npx prisma migrate dev --name v2_risk_engine
+
+5.1 Enums to Add
+Enum
+Values
+UserRole
+STUDENT, PARENT, EDUCATOR, ADVISOR, HOD, ADMIN
+RiskLevel
+GREEN (0-30), AMBER (31-60), RED (61-100)
+RiskFlagType
+LOW_ATTENDANCE, POOR_MARKS, STUDY_NEGLECT, WEAK_RECALL, LOW_LMS_ACTIVITY, BEHAVIOURAL_DROP, CONSECUTIVE_ABSENCES
+InterventionStatus
+PENDING_REVIEW, APPROVED, MODIFIED_SENT, ACKNOWLEDGED, COMPLETED, DISMISSED
+LMSSource
+MOODLE, GOOGLE_CLASSROOM, CSV_IMPORT
+AttendanceStatus
+PRESENT, ABSENT, LATE, EXCUSED
+
+5.2 New Models
+Model
+Purpose + Key Fields
+Department
+College department — name (unique), hodId (FK to User), subjects[]
+ParentStudentLink
+Links parent to child — parentId, studentId, relation (mother/father/guardian), isPrimary. Unique: [parentId, studentId]. Max 2 parents per student.
+AdvisorAssignment
+Links advisor to student — advisorId, studentId, assignedAt. Unique: [advisorId, studentId]
+CounsellingNote
+Advisor meeting notes — advisorId, studentId, note (Text), sessionAt
+AttendanceRecord
+Daily attendance — userId, subjectId, date, status, source, importBatch. Unique: [userId, subjectId, date]
+LMSActivityLog
+LMS usage events — userId, source, activityType, durationMins, loggedAt, metadata (Json)
+RiskScore
+Calculated risk snapshot — userId, score (0-100), level, calculatedAt, 6 dimension scores, aiExplanation, aiInterventions (Json)
+RiskFlag
+Individual risk signal — riskScoreId, userId, type, weight, detail, triggeredAt, resolvedAt (null = active)
+Intervention
+Educator-created plan — studentId, educatorId, riskScoreId, aiPlan (Text), finalPlan (Text), educatorNote, status, createdAt, sentAt, seenAt
+InterventionOutcome
+Follow-up result — interventionId (unique), followUpScore, deltaScore (negative = improved), studentFeedback, resolvedAt
+CompetitionEntry
+Student competition record — userId, name, category, result, participatedAt
+RiskThresholdConfig
+Configurable thresholds — departmentId (null=institution-wide), attendanceMin (75), marksMin (40), neglectDays (14), lmsLoginsMin (2)
+ChatMessage
+Parent-educator/advisor chat — fromId, toId, studentId (context), message (Text), readAt
+AuditLog
+Admin audit trail — userId, action, target, metadata (Json), createdAt
+LMSIntegration
+LMS connection config — institutionId, source, config (Json encrypted), lastSyncedAt, isActive
+SystemSnapshot
+Admin health snapshot — totalUsers, activeToday, redRiskCount, pendingInterventions, snapshotAt
+
+5.3 Relations to Add to Existing User Model
+Add these relation fields to the existing User model in schema.prisma — do not recreate the model:
+role                  UserRole @default(STUDENT)
+departmentId          String?
+rollNumber            String?
+yearOfStudy           Int?
+section               String?
+attendanceRecords     AttendanceRecord[]
+lmsActivityLogs       LMSActivityLog[]
+riskScores            RiskScore[]
+riskFlags             RiskFlag[]
+interventionsReceived Intervention[] @relation("StudentInterventions")
+interventionsSent     Intervention[] @relation("EducatorInterventions")
+advisorAssignments    AdvisorAssignment[] @relation("AdvisorLinks")
+studentAssignments    AdvisorAssignment[] @relation("StudentLinks")
+parentLinks           ParentStudentLink[] @relation("ParentLinks")
+studentParents        ParentStudentLink[] @relation("StudentParents")
+competitionEntries    CompetitionEntry[]
+counsellingNotes      CounsellingNote[] @relation("AdvisorNotes")
+counselledBy          CounsellingNote[] @relation("StudentNotes")
+
+6. Risk Score Engine — Full Specification
+IMPORTANT: The risk engine is hybrid. The RULE LAYER calculates all scores deterministically. Gemini ONLY writes the explanation and suggests interventions. Gemini never decides the score.
+
+6.1 Dimension Weights
+Dimension
+Data Source
+Weight
+Attendance
+AttendanceRecord — last 30 days
+25%
+Marks
+ExamMark — last 90 days
+25%
+Study Activity
+StudySession (v1 data)
+20%
+LMS Activity
+LMSActivityLog — last 14 days
+15%
+Recall Strength
+ReviewItem recallStrength (v1 data)
+10%
+Behavioural
+Derived from session length trend
+5%
+
+6.2 Scoring Logic
+Each dimension produces a safety score (0-100, higher = safer). These are weighted and summed into a composite safety score. Risk score = 100 - safetyScore. Risk score is then bucketed:
+0-30 → GREEN (On track)
+31-60 → AMBER (Needs attention)
+61-100 → RED (Urgent intervention required)
+
+6.3 Flag Thresholds
+Flag Type
+Trigger Condition
+Weight
+LOW_ATTENDANCE
+Attendance < 75% in last 30 days
+0.25
+LOW_ATTENDANCE (border)
+Attendance < 85% in last 30 days
+0.10
+CONSECUTIVE_ABSENCES
+3 or more consecutive absent days
+0.15
+POOR_MARKS
+Below 40% in 2 or more subjects
+0.25
+POOR_MARKS (border)
+Below 50% in 2 or more subjects
+0.10
+STUDY_NEGLECT
+No study session in 14+ days
+0.20
+STUDY_NEGLECT (severe)
+No study session in 30 days
+0.20 + score = 0
+BEHAVIOURAL_DROP
+Recent 15d sessions < 50% of prior 15d
+0.10
+LOW_LMS_ACTIVITY
+Less than 2 active LMS days per week
+0.15
+WEAK_RECALL
+3 or more ReviewItems rated WEAK
+0.10
+
+6.4 AI Layer — Gemini Constraints
+The AI layer receives: composite score, risk level, all dimension scores, all active flags with their detail strings, and student name. It is constrained by:
+System instruction: ONLY reference data provided — no invented context
+responseMimeType: "application/json" — forces JSON-only output
+temperature: 0.1 — minimises hallucination
+Zod validation on output before anything touches DB or UI
+Fallback rule-based explanation if AI fails or key not configured
+
+AI must return this exact JSON structure:
+{ explanation: string, predictedTrajectory: string, interventions: [{ rank: 1|2|3, title: string, action: string, urgency: "immediate"|"this_week"|"this_month", targetDimension: "attendance"|"marks"|"study_activity"|"lms_activity"|"recall"|"behavioural" }] }
+
+7. New API Routes — v2
+
+7.1 Risk Routes — /api/risk
+Method + Path
+Role
+Description
+GET /api/risk/me
+STUDENT
+Latest risk score + dimensions + flags for self
+POST /api/risk/me/calculate
+STUDENT
+Trigger risk recalculation for self
+GET /api/risk/cohort
+EDUCATOR, HOD, ADMIN
+All students sorted by risk level RED first
+GET /api/risk/:studentId
+EDUCATOR, HOD, ADMIN, ADVISOR
+Full risk breakdown + history + interventions for one student
+POST /api/risk/:studentId/calculate
+EDUCATOR, HOD, ADMIN
+Force recalculate risk for a specific student
+
+7.2 Intervention Routes — /api/interventions
+Method + Path
+Role
+Description
+GET /api/interventions/pending
+EDUCATOR, HOD
+Interventions awaiting review
+PATCH /api/interventions/:id/approve
+HOD
+Approve or modify + send to student
+PATCH /api/interventions/:id/dismiss
+HOD, EDUCATOR
+Dismiss as false positive
+GET /api/interventions/mine
+STUDENT
+Student's active interventions
+PATCH /api/interventions/:id/complete
+STUDENT
+Mark as completed + optional feedback
+GET /api/interventions/effectiveness
+HOD, ADMIN
+Outcome analytics
+POST /api/interventions/follow-ups
+CRON
+7-day follow-up processor — protected by CRON_SECRET
+
+7.3 LMS & Attendance Routes — /api/lms, /api/attendance
+Method + Path
+Role
+Description
+POST /api/lms/import/attendance
+ADMIN, EDUCATOR
+CSV upload: attendance records
+POST /api/lms/import/activity
+ADMIN, EDUCATOR
+CSV upload: LMS activity logs
+POST /api/lms/sync/moodle
+ADMIN
+Trigger Moodle REST API sync
+POST /api/lms/sync/classroom
+ADMIN
+Trigger Google Classroom API sync
+POST /api/lms/attendance
+EDUCATOR
+Manual single attendance record
+GET /api/lms/attendance/:userId
+EDUCATOR, HOD, PARENT
+Attendance summary for a student
+POST /api/competitions
+STUDENT
+Log a competition entry
+GET /api/competitions/:userId
+ALL
+Get competition history
+
+7.4 Parent Routes — /api/parent
+Method + Path
+Role
+Description
+GET /api/parent/children
+PARENT
+List linked children
+GET /api/parent/children/:id/summary
+PARENT
+Full child view: risk + attendance + marks + activity
+GET /api/parent/alerts
+PARENT
+Alert feed for all children (RED+AMBER only)
+POST /api/parent/chat
+PARENT
+Send chat message to educator/advisor
+GET /api/parent/chat/:studentId
+PARENT, EDUCATOR, ADVISOR
+Chat thread for a student
+
+7.5 Advisor Routes — /api/advisor
+Method + Path
+Role
+Description
+GET /api/advisor/students
+ADVISOR
+Assigned students sorted by risk level
+GET /api/advisor/students/:id
+ADVISOR
+Full student view
+POST /api/advisor/notes
+ADVISOR
+Log counselling note
+GET /api/advisor/notes/:studentId
+ADVISOR
+Counselling note history
+GET /api/advisor/interventions
+ADVISOR
+Interventions advisor has handled
+
+7.6 HoD Routes — /api/hod
+Method + Path
+Role
+Description
+GET /api/hod/department
+HOD
+All students risk summary for department
+GET /api/hod/heatmap
+HOD
+Subject x failure rate matrix data
+GET /api/hod/educators
+HOD
+Educator intervention activity table
+PATCH /api/hod/thresholds
+HOD
+Set department-level risk thresholds
+GET /api/hod/interventions/pending
+HOD
+RED interventions awaiting HoD approval
+PATCH /api/hod/interventions/:id/approve
+HOD
+HoD approves high-severity intervention
+POST /api/hod/reports/naac
+HOD
+Generate NAAC/NBA PDF — trilingual (EN/TA/HI)
+
+7.7 Admin Routes — /api/admin
+Method + Path
+Role
+Description
+GET /api/admin/users
+ADMIN
+All users paginated
+POST /api/admin/users
+ADMIN
+Create single user
+PATCH /api/admin/users/:id
+ADMIN
+Update user (role, dept, etc.)
+DELETE /api/admin/users/:id
+ADMIN
+Deactivate user
+POST /api/admin/users/bulk-import
+ADMIN
+CSV bulk import (Option B format)
+POST /api/admin/assign/advisor
+ADMIN
+Assign student to advisor
+POST /api/admin/assign/parent
+ADMIN
+Link parent to student
+GET /api/admin/departments
+ADMIN
+List departments
+POST /api/admin/departments
+ADMIN
+Create department
+PATCH /api/admin/departments/:id/hod
+ADMIN
+Assign HoD to department
+PATCH /api/admin/thresholds
+ADMIN
+Institution-wide risk config
+GET /api/admin/audit-logs
+ADMIN
+Paginated audit trail
+GET /api/admin/system/health
+ADMIN
+Live system snapshot
+GET /api/admin/lms/integrations
+ADMIN
+List LMS connections
+POST /api/admin/lms/integrations
+ADMIN
+Add LMS connection
+
+8. Frontend Pages — v2
+
+8.1 Shared New Components
+Component
+Description
+RoleRouter.tsx
+Reads JWT role on login, redirects to correct portal. Wraps react-router-dom Navigate.
+RiskScoreCard.tsx
+Reusable risk score display — shows score, level badge (GREEN/AMBER/RED), dimension bars, top flags. Used across all dashboards.
+ChatWidget.tsx
+WebSocket chat component — uses socket.io-client. Room: chat:{studentId}. Shows message history, typing indicator, read receipts.
+NotificationBell.tsx
+In-app notification bell with unread badge count. Dropdown shows recent alerts.
+InterventionTimeline.tsx
+Visual evidence trail — shows risk detected → created → sent → acknowledged → outcome. Critical for evaluator demo.
+
+8.2 Student Pages (additions to v1)
+Page
+What to build
+/dashboard (update)
+Add RiskScoreCard to existing dashboard. Add intervention inbox badge. Add "My Risk" section showing current level + top flag.
+/risk
+Full risk breakdown — all 6 dimension scores as bar chart, active flags list, AI explanation text, predictedTrajectory, 4-week projection chart, intervention history.
+/interventions/mine
+Student intervention inbox — list of sent plans, mark as complete, leave feedback.
+/study-plan (create)
+Study plan page — file upload (PDF/image/text via Gemini multimodal), AI breaks into weekly schedule, save to calendar view.
+
+8.3 Parent Portal — /parent/*
+Page
+What to build
+/parent/dashboard
+Cards for each child (max 2). Each card shows: name, risk badge, attendance %, last study session. Click to drill down.
+/parent/child/:id
+Full child view: RiskScoreCard, attendance calendar, subject marks table, recent study sessions, active interventions.
+/parent/alerts
+Notification feed — RED+AMBER alerts only. Each alert shows: date, risk level, which dimension triggered it, link to full view.
+/parent/chat
+Chat interface — select child context, see educator/advisor list, open WebSocket chat thread via ChatWidget.
+
+8.4 Advisor Portal — /advisor/*
+Page
+What to build
+/advisor/dashboard
+Assigned students list sorted by risk. RED students shown first with urgent badge. Quick access to each student profile.
+/advisor/student/:id
+Full student view: RiskScoreCard, risk history trend chart, active flags, InterventionTimeline, counselling notes history.
+/advisor/notes/:studentId
+Counselling notes — add new note with date/session time, view full history in reverse chronological order.
+/advisor/interventions
+Interventions the advisor has handled — status, outcome delta, student feedback.
+
+8.5 HoD Portal — /hod/*
+Page
+What to build
+/hod/dashboard
+Department overview: total students, RED/AMBER/GREEN counts as donut chart, top 5 at-risk students, recent intervention activity.
+/hod/students
+Full student table — filterable by risk level, subject, year. Each row: name, risk score, top flag, last assessed. Click to drill down.
+/hod/educators
+Educator engagement: interventions created, avg response time, pending reviews per educator.
+/hod/thresholds
+Form to set department risk thresholds: attendance min %, marks min %, neglect days, LMS logins/week.
+/hod/interventions
+Interventions pending HoD approval (RED cases only). Approve or modify before sending.
+/hod/reports
+NAAC/NBA report generator — select date range, click Generate. Downloads trilingual PDF.
+
+8.6 Admin Portal — /admin/*
+Page
+What to build
+/admin/dashboard
+System health: total users, active today, RED risk count, pending interventions, recent audit events.
+/admin/users
+User table with search/filter. Create user form. Edit role/department. Deactivate toggle.
+/admin/users/import
+CSV bulk import wizard — 3 steps: upload CSV, preview parsed rows, confirm import. Shows success/error per row.
+/admin/departments
+Department list with HoD name. Create department. Assign/change HoD from user dropdown.
+/admin/assignments
+Two sections: advisor-student assignments and parent-student links. Add/remove assignments.
+/admin/thresholds
+Institution-wide risk thresholds form. These are overridden by department-level settings.
+/admin/lms
+LMS integration management: Moodle config (baseUrl + token), Google Classroom (OAuth), CSV import.
+/admin/audit
+Audit log table — paginated, filterable by userId/action/date. Read-only.
+
+9. Complete File List — v2 New Files
+These files must be created. Files marked with (v1) already exist and must be edited.
+
+9.1 Server Files
+File
+Status
+server/src/services/riskEngine.ts
+CREATE — full risk calculation + AI layer
+server/src/services/interventionService.ts
+CREATE — intervention lifecycle
+server/src/services/lmsService.ts
+CREATE — CSV + Moodle + Google Classroom
+server/src/services/parentService.ts
+CREATE — parent child summary + alerts
+server/src/services/advisorService.ts
+CREATE — assigned students + counselling notes
+server/src/services/hodService.ts
+CREATE — dept heatmap + NAAC report generation
+server/src/services/adminService.ts
+CREATE — user CRUD + bulk import + assignments
+server/src/services/chatService.ts
+CREATE — message persistence for WebSocket chat
+server/src/services/naacReportService.ts
+CREATE — pdfkit trilingual PDF generation
+server/src/services/notificationService.ts
+CREATE — nodemailer email + in-app notification store
+server/src/routes/risk.ts
+CREATE
+server/src/routes/interventions.ts
+CREATE
+server/src/routes/lms.ts
+CREATE
+server/src/routes/parent.ts
+CREATE
+server/src/routes/advisor.ts
+CREATE
+server/src/routes/hod.ts
+CREATE
+server/src/routes/admin.ts
+CREATE
+server/src/routes/chat.ts
+CREATE
+server/src/middleware/roleGuard.ts
+CREATE — RBAC: requireRole(["HOD", "ADMIN"]) middleware
+server/src/socket/chatSocket.ts
+CREATE — Socket.io handler, rooms by studentId
+server/src/seeds/adminSeed.ts
+CREATE — creates first ADMIN account + sample data
+server/src/middleware/auth.ts
+EDIT (v1) — embed role in JWT, guard DEV_BYPASS
+server/src/index.ts
+EDIT (v1) — register new routes + Socket.io init + rate limiting
+server/prisma/schema.prisma
+EDIT (v1) — add all new models from Section 5
+
+9.2 Client Files
+File
+Status
+client/src/components/RoleRouter.tsx
+CREATE
+client/src/components/RiskScoreCard.tsx
+CREATE
+client/src/components/ChatWidget.tsx
+CREATE — socket.io-client
+client/src/components/NotificationBell.tsx
+CREATE
+client/src/components/InterventionTimeline.tsx
+CREATE
+client/src/pages/RiskPage.tsx
+CREATE — student full risk view
+client/src/pages/parent/DashboardPage.tsx
+CREATE
+client/src/pages/parent/ChildDetailPage.tsx
+CREATE
+client/src/pages/parent/AlertsPage.tsx
+CREATE
+client/src/pages/parent/ChatPage.tsx
+CREATE
+client/src/pages/advisor/DashboardPage.tsx
+CREATE
+client/src/pages/advisor/StudentDetailPage.tsx
+CREATE
+client/src/pages/advisor/NotesPage.tsx
+CREATE
+client/src/pages/advisor/InterventionsPage.tsx
+CREATE
+client/src/pages/hod/DashboardPage.tsx
+CREATE
+client/src/pages/hod/StudentsPage.tsx
+CREATE
+client/src/pages/hod/EducatorsPage.tsx
+CREATE
+client/src/pages/hod/ThresholdsPage.tsx
+CREATE
+client/src/pages/hod/InterventionsPage.tsx
+CREATE
+client/src/pages/hod/ReportsPage.tsx
+CREATE
+client/src/pages/admin/DashboardPage.tsx
+CREATE
+client/src/pages/admin/UsersPage.tsx
+CREATE
+client/src/pages/admin/ImportPage.tsx
+CREATE
+client/src/pages/admin/DepartmentsPage.tsx
+CREATE
+client/src/pages/admin/AssignmentsPage.tsx
+CREATE
+client/src/pages/admin/ThresholdsPage.tsx
+CREATE
+client/src/pages/admin/LMSPage.tsx
+CREATE
+client/src/pages/admin/AuditPage.tsx
+CREATE
+client/src/pages/StudyPlanPage.tsx
+CREATE — was missing in v1
+client/src/lib/api.ts
+EDIT (v1) — add all new API calls
+client/src/lib/socket.ts
+CREATE — socket.io-client setup
+client/src/types/api.ts
+EDIT (v1) — add all new response types
+client/src/App.tsx
+EDIT (v1) — add new routes + RoleRouter
+client/src/pages/LoginPage.tsx
+EDIT (v1) — add role selector dropdown
+
+10. New npm Packages Required
+
+10.1 Server
+Package
+Version
+Purpose
+express-rate-limit
+^7.x
+Rate limiting on AI routes
+socket.io
+^4.x
+WebSocket server for chat
+multer
+^1.x
+File upload middleware (CSV + PDF/images)
+nodemailer
+^6.x
+Email notifications for critical alerts
+pdfkit
+^0.x
+NAAC PDF report generation
+zod
+^3.x
+Runtime validation for AI outputs
+node-cron
+^3.x
+7-day follow-up job scheduler
+csv-parse
+^5.x
+CSV parsing for bulk import
+
+10.2 Client
+Package
+Version
+Purpose
+socket.io-client
+^4.x
+WebSocket client for chat
+recharts
+^2.x
+Risk score charts + dimension bar charts
+
+11. Environment Variables
+
+11.1 Existing (v1) — must remain
+Variable
+Description
+DATABASE_URL
+PostgreSQL connection string
+JWT_SECRET
+JWT signing secret
+GEMINI_API_KEY
+Google Gemini API key (free tier)
+NODE_ENV
+development or production
+PORT
+Server port (default 3001)
+
+11.2 New (v2) — add to .env
+Variable
+Description
+SMTP_HOST
+nodemailer SMTP server (e.g. smtp.gmail.com)
+SMTP_PORT
+SMTP port (587 for TLS)
+SMTP_USER
+Email address for sending alerts
+SMTP_PASS
+Email password or app password
+CRON_SECRET
+Secret header for cron endpoint protection
+ADMIN_SEED_EMAIL
+Email for first admin account (seed script)
+ADMIN_SEED_PASSWORD
+Password for first admin account (seed script)
+
+12. CSV Import Formats
+
+12.1 Bulk Student Import (Admin)
+Use Option B — Full format. This creates users AND automatically links parents and assigns advisors in one upload.
+Filename: students_import.csv
+Headers (row 1):
+email,password,name,role,departmentId,rollNumber,year,section,parentEmail1,parentEmail2,advisorEmail
+Notes:
+role must be one of: STUDENT, PARENT, EDUCATOR, ADVISOR, HOD, ADMIN
+parentEmail1 and parentEmail2 are optional — if provided, a ParentStudentLink is auto-created
+advisorEmail is optional — if provided, an AdvisorAssignment is auto-created
+departmentId must match an existing Department id in the database
+
+12.2 Attendance Import
+Headers: userId,subjectId,date,status
+date format: YYYY-MM-DD. status: PRESENT, ABSENT, LATE, EXCUSED
+
+12.3 LMS Activity Import
+Headers: userId,activityType,durationMins,loggedAt
+loggedAt format: ISO 8601. activityType examples: login, assignment_submit, resource_view, forum_post
+
+13. WebSocket Chat — Technical Spec
+
+13.1 Room Structure
+Rooms are scoped by studentId: chat:{studentId}
+Members of a room: all parents of that student + all educators of that student's subjects + all advisors assigned to that student
+
+13.2 Events
+Direction
+Event
+Payload
+client → server
+chat:join
+{ studentId, userId, role }
+client → server
+chat:message
+{ studentId, toId, message }
+client → server
+chat:typing
+{ studentId, userId, isTyping }
+server → client
+chat:message
+{ id, fromId, fromName, message, createdAt }
+server → client
+chat:history
+{ messages: ChatMessage[] }
+server → client
+chat:typing
+{ userId, isTyping }
+server → client
+chat:read
+{ messageIds: string[] }
+
+13.3 Persistence
+All messages are persisted to the ChatMessage table in the database. On chat:join, the server sends the last 50 messages as chat:history. This ensures chat history survives page refresh and reconnects.
+
+14. NAAC/NBA Report — PDF Specification
+
+Generated server-side using pdfkit. Endpoint: POST /api/hod/reports/naac
+Language: Trilingual — English headers with Tamil and Hindi translations below each section title.
+
+14.1 Report Sections
+Executive Summary — institution name, date range, total students, RED/AMBER/GREEN counts, overall intervention rate
+Department Risk Overview — table: department name, student count, RED count, AMBER count, avg risk score
+Subject-wise Failure Rate Heatmap — table: subject name, enrolled count, below 40% count, below 50% count, avg marks %
+At-Risk Student Remediation Evidence — anonymised list: student ID, risk level, intervention sent date, outcome (improved/pending/worsened)
+Educator Engagement Metrics — educator name, interventions created, avg response time (hours), completion rate
+Trend Analysis — risk score distribution over selected date range. Text summary of improvement or deterioration.
+Appendix — methodology note explaining the hybrid risk scoring approach
+
+15. Build Order — Exact Sequence
+Follow this order precisely. Later phases depend on earlier ones being complete.
+
+Phase 0 — v1 Bug Fixes (Day 1 morning, ~2.5 hours)
+Fix any[] type in SessionsPage.tsx
+Add rate limiting to AI routes
+Guard DEV_BYPASS_AUTH in auth.ts
+Fix NotesPanel overflow
+Fix Jump to Revision context loss
+Build session debrief callback
+
+Phase 1 — Schema & Foundation (Day 1 afternoon, ~4 hours)
+Add UserRole enum to User model, default STUDENT for existing users
+Add Department model and departmentId FK to Subject and User
+Add all v2 models from Section 5
+Run prisma migrate dev --name v2_risk_engine
+Create adminSeed.ts and run it to create first admin account
+Create roleGuard.ts middleware
+Update auth.ts to embed role in JWT
+Register all new routes in server/src/index.ts
+
+Phase 2 — Risk Engine (Day 2, ~8 hours)
+Build riskEngine.ts — all 6 dimension calculators + composite score
+Build AI explanation layer in riskEngine.ts
+Build risk routes (risk.ts)
+Build notificationService.ts — nodemailer + in-app store
+Add predictive trajectory calculation (4-week projection)
+
+Phase 3 — Intervention Pipeline (Day 3, ~8 hours)
+Build interventionService.ts — full lifecycle
+Build interventionRoutes.ts
+Wire HoD approval gate — RED interventions blocked until HOD approves
+Build 7-day follow-up cron with node-cron
+Build notificationService email dispatch on intervention sent
+
+Phase 4 — LMS & Data (Day 4, ~8 hours)
+Build lmsService.ts — CSV + Moodle + Google Classroom
+Build lmsRoutes.ts + attendanceRoutes.ts
+Build competitionRoutes.ts
+Create demo seed data — realistic multi-source student data
+
+Phase 5 — Role Dashboards (Days 5-8, ~32 hours)
+Build RoleRouter.tsx + login role selector
+Build Student risk pages (RiskPage.tsx + InterventionTimeline)
+Build Parent portal — all 4 pages + ChatWidget
+Build Advisor portal — all 4 pages
+Build HoD portal — all 6 pages + NAAC PDF
+Build Admin portal — all 8 pages including import wizard
+
+Phase 6 — Polish & PS Alignment (Day 9, ~8 hours)
+Build StudyPlanPage.tsx with file upload
+Refactor SRS RecallStrength to Flashcard level
+Add predictive trajectory visualisation chart
+Add InterventionTimeline component — visual evidence trail for evaluators
+Add pagination to list endpoints
+Generate trilingual NAAC PDF with pdfkit
+Final integration testing across all 6 roles

@@ -37,6 +37,7 @@ export const errorHandler = (
 ): void => {
     console.error(`[ERROR] ${req.method} ${req.path}:`, err.message);
 
+
     if (err instanceof ApiError) {
         res.status(err.statusCode).json({
             error: err.message,

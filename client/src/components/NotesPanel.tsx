@@ -17,11 +17,13 @@ interface NotesPanelProps {
     topic?: string;
     /** Visual context label e.g. "Mathematics – Calculus" */
     contextLabel?: string;
+    /** Called whenever the draft text changes — lets parent read live content for AI generation */
+    onNotesChange?: (text: string) => void;
 }
 
 const SAVE_DEBOUNCE_MS = 1500;
 
-export function NotesPanel({ subjectId, topic, contextLabel }: NotesPanelProps) {
+export function NotesPanel({ subjectId, topic, contextLabel, onNotesChange }: NotesPanelProps) {
     const [notes, setNotes] = useState<Note[]>([]);
     const [draft, setDraft] = useState('');
     const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
@@ -37,6 +39,7 @@ export function NotesPanel({ subjectId, topic, contextLabel }: NotesPanelProps) 
     const load = useCallback(async () => {
         if (!subjectId) return;
         try {
+            // Fetch all notes for this subject+topic (if topic given) OR all subject notes
             const list = await notesApi.list(subjectId, topic);
             setNotes(list);
             // Use the most-recently-updated note as the active draft
@@ -44,9 +47,11 @@ export function NotesPanel({ subjectId, topic, contextLabel }: NotesPanelProps) 
                 const latest = list[0];
                 setActiveNoteId(latest.id);
                 setDraft(latest.content);
+                onNotesChange?.(latest.content);
             } else {
                 setActiveNoteId(null);
                 setDraft('');
+                onNotesChange?.('');
             }
         } catch {
             setLoadError('Could not load notes.');
@@ -89,6 +94,7 @@ export function NotesPanel({ subjectId, topic, contextLabel }: NotesPanelProps) 
     const handleChange = (val: string) => {
         setDraft(val);
         setSaveStatus('idle');
+        onNotesChange?.(val);
         if (debounceRef.current) clearTimeout(debounceRef.current);
         if (val.trim()) {
             debounceRef.current = setTimeout(() => saveNote(val), SAVE_DEBOUNCE_MS);

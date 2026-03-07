@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { reviewsApi, ApiError } from '../lib/api';
 import { useSubjects } from '../context/SubjectsContext';
 import type { ReviewItem, Flashcard, RecallStrength } from '../types/api';
@@ -43,6 +44,9 @@ type PracticePhase = 'queue' | 'cards' | 'done';
 
 export function ReviewsPage() {
     const { subjects, loading: subjectsLoading } = useSubjects();
+    // Bug 5 fix: read subjectId passed via navigate state from SessionsPage
+    const location = useLocation();
+    const jumpToSubjectId = (location.state as { subjectId?: string } | null)?.subjectId ?? null;
 
     const [queue, setQueue] = useState<ReviewItem[]>([]);
     const [loading, setLoading] = useState(true);
@@ -76,10 +80,14 @@ export function ReviewsPage() {
     }
     useEffect(() => { load(); }, []);
 
-    // Auto-select first subject from context
+    // Bug 5 fix: if arrived via "Jump to Revision", pre-select the session's subject
     useEffect(() => {
-        if (subjects.length > 0 && !selectedSubject) setSelectedSubject(subjects[0].id);
-    }, [subjects, selectedSubject]);
+        if (jumpToSubjectId) {
+            setSelectedSubject(jumpToSubjectId);
+        } else if (subjects.length > 0 && !selectedSubject) {
+            setSelectedSubject(subjects[0].id);
+        }
+    }, [subjects, selectedSubject, jumpToSubjectId]);
 
     async function handleCreate(e: React.FormEvent) {
         e.preventDefault();

@@ -15,7 +15,7 @@ import {
 } from '../schemas/aiSchemas';
 import type { AIFlashcard, AIQuizQuestion } from '../schemas/aiSchemas';
 
-const MODEL_NAME = 'gemini-1.5-flash';
+const MODEL_NAME = 'gemini-2.5-flash';
 
 function getModel() {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -52,11 +52,15 @@ function fileToGeminiPart(buffer: Buffer, mimeType: string): Part {
 }
 
 function parseAndClean(rawText: string): unknown {
-    // Strip any ```json ... ``` fences Gemini might add despite instructions
-    const cleaned = rawText.trim()
-        .replace(/^```json\n?/, '')
-        .replace(/\n?```$/, '');
-    return JSON.parse(cleaned);
+    let text = rawText.trim();
+    // Gemini 2.5 Flash is a thinking model — strip reasoning blocks first
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    // Strip ```json ... ``` fences Gemini might add despite instructions
+    text = text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    // If leading non-JSON content, find first { or [
+    const jsonStart = text.search(/[{[]/);
+    if (jsonStart > 0) text = text.slice(jsonStart);
+    return JSON.parse(text);
 }
 
 // ─────────────────────────────────────────────────────────────

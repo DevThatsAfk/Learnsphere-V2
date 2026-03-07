@@ -1,9 +1,9 @@
-// LearnSphere — Definitive Prisma Schema
-// Source of truth: DATABASE_SCHEMA.md (synchronized with API_CONTRACTS.md v1.0.0)
-// DO NOT edit manually — changes must go through migration
+// LearnSphere — Definitive Prisma Schema v2
+// v1 models unchanged. v2 adds risk, interventions, LMS, roles, and institutional layer.
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -12,11 +12,15 @@ datasource db {
 }
 
 // ─────────────────────────────────────────────────
-// ENUMS
+// ENUMS — v1
 // ─────────────────────────────────────────────────
 
 enum UserRole {
   STUDENT
+  PARENT
+  EDUCATOR
+  ADVISOR
+  HOD
   ADMIN
 }
 
@@ -38,7 +42,49 @@ enum RecallStrength {
 }
 
 // ─────────────────────────────────────────────────
-// MODELS
+// ENUMS — v2
+// ─────────────────────────────────────────────────
+
+enum RiskLevel {
+  GREEN
+  AMBER
+  RED
+}
+
+enum RiskFlagType {
+  LOW_ATTENDANCE
+  POOR_MARKS
+  STUDY_NEGLECT
+  WEAK_RECALL
+  LOW_LMS_ACTIVITY
+  BEHAVIOURAL_DROP
+  CONSECUTIVE_ABSENCES
+}
+
+enum InterventionStatus {
+  PENDING_REVIEW
+  APPROVED
+  MODIFIED_SENT
+  ACKNOWLEDGED
+  COMPLETED
+  DISMISSED
+}
+
+enum LMSSource {
+  MOODLE
+  GOOGLE_CLASSROOM
+  CSV_IMPORT
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+// ─────────────────────────────────────────────────
+// MODELS — v1 (unchanged structure)
 // ─────────────────────────────────────────────────
 
 model User {
@@ -48,9 +94,36 @@ model User {
   role         UserRole @default(STUDENT)
   createdAt    DateTime @default(now()) @map("created_at")
 
+  // v2 profile fields
+  departmentId  String? @map("department_id")
+  rollNumber    String? @map("roll_number")
+  yearOfStudy   Int?    @map("year_of_study")
+  section       String?
+
+  // v1 relations
   subjects Subject[]
   notes    Note[]
   exams    Exam[]
+
+  // v2 relations
+  department            Department?          @relation(fields: [departmentId], references: [id])
+  attendanceRecords     AttendanceRecord[]
+  lmsActivityLogs       LMSActivityLog[]
+  riskScores            RiskScore[]
+  riskFlags             RiskFlag[]
+  interventionsReceived Intervention[]       @relation("StudentInterventions")
+  interventionsSent     Intervention[]       @relation("EducatorInterventions")
+  advisorAssignments    AdvisorAssignment[]  @relation("AdvisorLinks")
+  studentAssignments    AdvisorAssignment[]  @relation("StudentLinks")
+  parentLinks           ParentStudentLink[]  @relation("ParentLinks")
+  studentParents        ParentStudentLink[]  @relation("StudentParents")
+  competitionEntries    CompetitionEntry[]
+  counsellingNotes      CounsellingNote[]    @relation("AdvisorNotes")
+  counselledBy          CounsellingNote[]    @relation("StudentNotes")
+  chatsSent             ChatMessage[]        @relation("ChatFrom")
+  chatsReceived         ChatMessage[]        @relation("ChatTo")
+  auditLogs             AuditLog[]
+  hodDepartments        Department[]         @relation("DeptHoD")
 
   @@map("users")
 }
@@ -68,6 +141,7 @@ model Subject {
   reviewItems       ReviewItem[]
   examMarks         ExamMark[]
   notes             Note[]
+  attendanceRecords AttendanceRecord[]
 
   @@map("subjects")
 }
@@ -177,20 +251,258 @@ model Flashcard {
   @@map("flashcards")
 }
 
-// ─────────────────────────────────────────────────
-// STUDY NOTES (Feature 2 — user-authored, never AI-modified)
-// ─────────────────────────────────────────────────
 model Note {
   id        String   @id @default(cuid())
   userId    String   @map("user_id")
   subjectId String   @map("subject_id")
-  topic     String?  // optional — links note to a specific session topic
+  topic     String?
   content   String   @default("")
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt      @map("updated_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
-  user    User    @relation(fields: [userId],    references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
 
   @@map("notes")
+}
+
+// ─────────────────────────────────────────────────
+// MODELS — v2 Institutional Layer
+// ─────────────────────────────────────────────────
+
+model Department {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  hodId     String?  @map("hod_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  hod      User?                @relation("DeptHoD", fields: [hodId], references: [id])
+  users    User[]
+  subjects RiskThresholdConfig?
+
+  @@map("departments")
+}
+
+model ParentStudentLink {
+  id        String   @id @default(cuid())
+  parentId  String   @map("parent_id")
+  studentId String   @map("student_id")
+  relation  String   @default("guardian") // mother / father / guardian
+  isPrimary Boolean  @default(false) @map("is_primary")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  parent  User @relation("ParentLinks", fields: [parentId], references: [id], onDelete: Cascade)
+  student User @relation("StudentParents", fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([parentId, studentId])
+  @@map("parent_student_links")
+}
+
+model AdvisorAssignment {
+  id         String   @id @default(cuid())
+  advisorId  String   @map("advisor_id")
+  studentId  String   @map("student_id")
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  advisor User @relation("AdvisorLinks", fields: [advisorId], references: [id], onDelete: Cascade)
+  student User @relation("StudentLinks", fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([advisorId, studentId])
+  @@map("advisor_assignments")
+}
+
+model CounsellingNote {
+  id        String   @id @default(cuid())
+  advisorId String   @map("advisor_id")
+  studentId String   @map("student_id")
+  note      String
+  sessionAt DateTime @map("session_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  advisor User @relation("AdvisorNotes", fields: [advisorId], references: [id], onDelete: Cascade)
+  student User @relation("StudentNotes", fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@map("counselling_notes")
+}
+
+model AttendanceRecord {
+  id          String           @id @default(cuid())
+  userId      String           @map("user_id")
+  subjectId   String           @map("subject_id")
+  date        DateTime         @db.Date
+  status      AttendanceStatus
+  source      LMSSource        @default(CSV_IMPORT)
+  importBatch String?          @map("import_batch")
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject Subject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, subjectId, date])
+  @@map("attendance_records")
+}
+
+model LMSActivityLog {
+  id           String    @id @default(cuid())
+  userId       String    @map("user_id")
+  source       LMSSource
+  activityType String    @map("activity_type")
+  durationMins Int?      @map("duration_mins")
+  loggedAt     DateTime  @map("logged_at")
+  metadata     Json?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("lms_activity_logs")
+}
+
+model RiskScore {
+  id                    String    @id @default(cuid())
+  userId                String    @map("user_id")
+  score                 Float
+  level                 RiskLevel
+  calculatedAt          DateTime  @default(now()) @map("calculated_at")
+
+  // 6 dimension scores (0-100, higher = safer)
+  attendanceScore       Float     @default(100) @map("attendance_score")
+  marksScore            Float     @default(100) @map("marks_score")
+  studyActivityScore    Float     @default(100) @map("study_activity_score")
+  lmsActivityScore      Float     @default(100) @map("lms_activity_score")
+  recallScore           Float     @default(100) @map("recall_score")
+  behaviouralScore      Float     @default(100) @map("behavioural_score")
+
+  aiExplanation     String? @map("ai_explanation")
+  aiInterventions   Json?   @map("ai_interventions")
+
+  user  User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  flags RiskFlag[]
+
+  @@map("risk_scores")
+}
+
+model RiskFlag {
+  id          String      @id @default(cuid())
+  riskScoreId String      @map("risk_score_id")
+  userId      String      @map("user_id")
+  type        RiskFlagType
+  weight      Float
+  detail      String
+  triggeredAt DateTime    @default(now()) @map("triggered_at")
+  resolvedAt  DateTime?   @map("resolved_at")
+
+  riskScore RiskScore @relation(fields: [riskScoreId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("risk_flags")
+}
+
+model Intervention {
+  id           String             @id @default(cuid())
+  studentId    String             @map("student_id")
+  educatorId   String             @map("educator_id")
+  riskScoreId  String             @map("risk_score_id")
+  aiPlan       String?            @map("ai_plan")
+  finalPlan    String?            @map("final_plan")
+  educatorNote String?            @map("educator_note")
+  status       InterventionStatus @default(PENDING_REVIEW)
+  createdAt    DateTime           @default(now()) @map("created_at")
+  sentAt       DateTime?          @map("sent_at")
+  seenAt       DateTime?          @map("seen_at")
+
+  student  User                  @relation("StudentInterventions", fields: [studentId], references: [id], onDelete: Cascade)
+  educator User                  @relation("EducatorInterventions", fields: [educatorId], references: [id])
+  outcome  InterventionOutcome?
+
+  @@map("interventions")
+}
+
+model InterventionOutcome {
+  id              String   @id @default(cuid())
+  interventionId  String   @unique @map("intervention_id")
+  followUpScore   Float?   @map("follow_up_score")
+  deltaScore      Float?   @map("delta_score")
+  studentFeedback String?  @map("student_feedback")
+  resolvedAt      DateTime @default(now()) @map("resolved_at")
+
+  intervention Intervention @relation(fields: [interventionId], references: [id], onDelete: Cascade)
+
+  @@map("intervention_outcomes")
+}
+
+model CompetitionEntry {
+  id              String   @id @default(cuid())
+  userId          String   @map("user_id")
+  name            String
+  category        String
+  result          String?
+  participatedAt  DateTime @map("participated_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("competition_entries")
+}
+
+model RiskThresholdConfig {
+  id             String  @id @default(cuid())
+  departmentId   String? @unique @map("department_id")
+  attendanceMin  Float   @default(75) @map("attendance_min")
+  marksMin       Float   @default(40) @map("marks_min")
+  neglectDays    Int     @default(14) @map("neglect_days")
+  lmsLoginsMin   Int     @default(2) @map("lms_logins_min")
+
+  department Department? @relation(fields: [departmentId], references: [id])
+
+  @@map("risk_threshold_configs")
+}
+
+model ChatMessage {
+  id        String    @id @default(cuid())
+  fromId    String    @map("from_id")
+  toId      String    @map("to_id")
+  studentId String    @map("student_id") // context — which student is this chat about
+  message   String
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  from User @relation("ChatFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to   User @relation("ChatTo", fields: [toId], references: [id], onDelete: Cascade)
+
+  @@map("chat_messages")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  action    String
+  target    String?
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("audit_logs")
+}
+
+model LMSIntegration {
+  id            String    @id @default(cuid())
+  institutionId String    @map("institution_id")
+  source        LMSSource
+  config        Json      // encrypted connection config
+  lastSyncedAt  DateTime? @map("last_synced_at")
+  isActive      Boolean   @default(true) @map("is_active")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@map("lms_integrations")
+}
+
+model SystemSnapshot {
+  id                   String   @id @default(cuid())
+  totalUsers           Int      @map("total_users")
+  activeToday          Int      @map("active_today")
+  redRiskCount         Int      @map("red_risk_count")
+  pendingInterventions Int      @map("pending_interventions")
+  snapshotAt           DateTime @default(now()) @map("snapshot_at")
+
+  @@map("system_snapshots")
 }

@@ -1,0 +1,7 @@
+email,password,role,department,rollNumber,yearOfStudy,section,parentEmail,advisorEmail
+bulktest.student1@learnsphere.test,Bulk@12345,STUDENT,Computer Science,CS2024001,2,A,,
+bulktest.student2@learnsphere.test,Bulk@12345,STUDENT,Computer Science,CS2024002,2,A,,
+bulktest.student3@learnsphere.test,Bulk@12345,STUDENT,Electronics Engineering,EE2024001,1,B,,
+bulktest.educator1@learnsphere.test,Bulk@12345,EDUCATOR,Computer Science,,,,, 
+bulktest.advisor1@learnsphere.test,Bulk@12345,ADVISOR,Computer Science,,,,,
+bulktest.parent1@learnsphere.test,Bulk@12345,PARENT,,,,,bulktest.student1@learnsphere.test,

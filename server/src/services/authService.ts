@@ -16,14 +16,17 @@ interface LoginInput {
 }
 
 interface AuthResult {
+    id: string;
     token: string;
+    role: string;
+    email: string;
 }
 
-function generateToken(userId: string, email: string): string {
+function generateToken(userId: string, email: string, role: string): string {
     const secret = process.env.JWT_SECRET;
     if (!secret) throw new ApiError(500, 'JWT secret not configured.', 'CONFIG_ERROR');
-
-    return jwt.sign({ userId, email }, secret, { expiresIn: '7d' });
+    // v2: role embedded in JWT so auth middleware can expose req.role
+    return jwt.sign({ userId, email, role }, secret, { expiresIn: '7d' });
 }
 
 export async function register(input: RegisterInput): Promise<AuthResult> {
@@ -47,8 +50,9 @@ export async function register(input: RegisterInput): Promise<AuthResult> {
         data: { email, passwordHash },
     });
 
-    const token = generateToken(user.id, user.email);
-    return { token };
+    const token = generateToken(user.id, user.email, user.role);
+    // v2: return role so client can drive RoleRouter on registration
+    return { id: user.id, token, role: user.role, email: user.email };
 }
 
 export async function login(input: LoginInput): Promise<AuthResult> {
@@ -69,6 +73,7 @@ export async function login(input: LoginInput): Promise<AuthResult> {
         throw new ApiError(401, 'Invalid email or password.', 'INVALID_CREDENTIALS');
     }
 
-    const token = generateToken(user.id, user.email);
-    return { token };
+    const token = generateToken(user.id, user.email, user.role);
+    // v2: return role so client RoleRouter can redirect to correct portal
+    return { id: user.id, token, role: user.role, email: user.email };
 }

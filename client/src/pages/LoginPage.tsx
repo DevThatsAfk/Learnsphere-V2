@@ -4,17 +4,29 @@ import { useAuth } from '../context/AuthContext';
 import { ApiError } from '../lib/api';
 import { Spinner } from '../components/ui';
 
+const ROLE_REDIRECT: Record<string, string> = {
+    STUDENT: '/dashboard',
+    PARENT: '/parent/dashboard',
+    EDUCATOR: '/educator/dashboard',
+    ADVISOR: '/advisor/dashboard',
+    HOD: '/hod/dashboard',
+    ADMIN: '/admin/dashboard',
+};
+
 type Mode = 'login' | 'register';
 
 export function LoginPage() {
-    const { isAuthenticated, login, register } = useAuth();
+    const { isAuthenticated, role, login, register } = useAuth();
     const [mode, setMode] = useState<Mode>('login');
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    if (isAuthenticated) return <Navigate to="/dashboard" replace />;
+    if (isAuthenticated) {
+        const target = ROLE_REDIRECT[role ?? 'STUDENT'] ?? '/dashboard';
+        return <Navigate to={target} replace />;
+    }
 
     async function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
@@ -98,8 +110,8 @@ export function LoginPage() {
                                 id={`btn-${m}`}
                                 onClick={() => { setMode(m); setError(null); }}
                                 className={`flex-1 rounded-lg py-2 text-sm font-semibold transition-all duration-200 ${mode === m
-                                        ? 'bg-white text-indigo-600 shadow-sm'
-                                        : 'text-slate-500 hover:text-slate-700'
+                                    ? 'bg-white text-indigo-600 shadow-sm'
+                                    : 'text-slate-500 hover:text-slate-700'
                                     }`}
                             >
                                 {m === 'login' ? 'Sign in' : 'Sign up'}

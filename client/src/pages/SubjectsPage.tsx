@@ -65,7 +65,7 @@ function SubjectRow({
                         disabled={saving}
                     />
                 ) : (
-                    <span className="flex-1 text-slate-200 font-medium">{subject.name}</span>
+                    <span className="flex-1 text-slate-700 font-medium">{subject.name}</span>
                 )}
 
                 <div className="flex items-center gap-1 shrink-0">

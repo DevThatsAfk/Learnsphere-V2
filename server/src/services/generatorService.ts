@@ -11,7 +11,23 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { ApiError } from '../middleware/errorHandler';
 import { FlashcardsResponseSchema, QuizResponseSchema } from '../schemas/aiSchemas';
 
-const MODEL_NAME = 'gemini-1.5-flash';
+const MODEL_NAME = 'gemini-2.5-flash';
+
+/**
+ * Gemini 2.5 Flash is a 'thinking' model — it wraps its reasoning in <think>...</think>
+ * blocks before the actual JSON response. Strip those and any markdown fences before parsing.
+ */
+function extractJSON(rawText: string): unknown {
+    let text = rawText.trim();
+    // Remove thinking blocks
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    // Strip markdown code fences
+    text = text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    // If there's still leading non-JSON content, find the first { or [
+    const jsonStart = text.search(/[{[]/);
+    if (jsonStart > 0) text = text.slice(jsonStart);
+    return JSON.parse(text);
+}
 
 // ─── Generate Flashcards from Note Content ────────────────────────
 export async function generateFlashcardsFromNotes(noteContent: string) {
@@ -21,10 +37,7 @@ export async function generateFlashcardsFromNotes(noteContent: string) {
     }
 
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-        model: MODEL_NAME,
-        generationConfig: { responseMimeType: 'application/json' },
-    });
+    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
     const prompt = `
         You are an academic flashcard generator. Extract exactly 5 high-quality flashcards from the text.
@@ -46,7 +59,7 @@ export async function generateFlashcardsFromNotes(noteContent: string) {
 
     try {
         const result = await model.generateContent(prompt);
-        const raw = JSON.parse(result.response.text());
+        const raw = extractJSON(result.response.text());
 
         // Bug 5 fix: Zod validation — reject malformed AI output
         const validated = FlashcardsResponseSchema.safeParse(raw);
@@ -68,10 +81,7 @@ export async function generateQuizFromNotes(noteContent: string) {
     if (!apiKey) throw new ApiError(503, 'AI Generator not configured.', 'GENERATOR_NOT_CONFIGURED');
 
     const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-        model: MODEL_NAME,
-        generationConfig: { responseMimeType: 'application/json' },
-    });
+    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
     // Bug 1 fix: correctAnswer is now a 0-based NUMBER index, not a "correct": string
     const prompt = `
@@ -95,7 +105,7 @@ export async function generateQuizFromNotes(noteContent: string) {
 
     try {
         const result = await model.generateContent(prompt);
-        const raw = JSON.parse(result.response.text());
+        const raw = extractJSON(result.response.text());
 
         // Bug 1+5 fix: Zod validates correctAnswer is a number in range 0-3
         const validated = QuizResponseSchema.safeParse(raw);
