@@ -209,7 +209,7 @@ export function SmartNotesPage() {
 
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    const inputWords = wordCount(inputText);
+    const _inputWords = wordCount(inputText);
     const MAX_CHARS = 20_000;
     const tooShort = inputText.trim().length > 0 && inputText.trim().length < 30;
     const tooLong = inputText.length > MAX_CHARS;

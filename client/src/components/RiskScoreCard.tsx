@@ -116,7 +116,7 @@ export function RiskScoreCard({
                         <RadialBarChart cx="50%" cy="50%" innerRadius="60%" outerRadius="100%"
                             data={chartData} startAngle={180} endAngle={0}>
                             <RadialBar background dataKey="value" cornerRadius={6} />
-                            <Tooltip formatter={(v: number) => [`${v.toFixed(1)}`, 'Risk']} />
+                            <Tooltip formatter={(v: number | undefined) => [`${(v ?? 0).toFixed(1)}`, 'Risk']} />
                         </RadialBarChart>
                     </ResponsiveContainer>
                 </div>
