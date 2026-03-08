@@ -7,6 +7,7 @@
  */
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { BASE_URL } from '../lib/api';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { InterventionTimeline } from '../components/InterventionTimeline';
 import type { InterventionTimelineProps } from '../components/InterventionTimeline';
@@ -56,9 +57,9 @@ export default function HoDPortal() {
 
     const fetchData = useCallback(async () => {
         const [dRes, hRes, pRes] = await Promise.all([
-            fetch('/api/hod/department', { headers: authHeaders }),
-            fetch('/api/hod/heatmap', { headers: authHeaders }),
-            fetch('/api/hod/interventions/pending', { headers: authHeaders }),
+            fetch(`${BASE_URL}/hod/department`, { headers: authHeaders }),
+            fetch(`${BASE_URL}/hod/heatmap`, { headers: authHeaders }),
+            fetch(`${BASE_URL}/hod/interventions/pending`, { headers: authHeaders }),
         ]);
         if (dRes.ok) setDept(await dRes.json());
         if (hRes.ok) setHeatmap(await hRes.json());
@@ -70,7 +71,7 @@ export default function HoDPortal() {
     async function handleApprove(id: string, plan?: string) {
         setSubmitting(true);
         try {
-            await fetch(`/api/interventions/${id}/approve`, {
+            await fetch(`${BASE_URL}/interventions/${id}/approve`, {
                 method: 'PATCH',
                 headers: authHeaders,
                 body: JSON.stringify({ finalPlan: plan || undefined }),
@@ -84,7 +85,7 @@ export default function HoDPortal() {
     }
 
     async function handleDismiss(id: string) {
-        await fetch(`/api/interventions/${id}/dismiss`, { method: 'PATCH', headers: authHeaders });
+        await fetch(`${BASE_URL}/interventions/${id}/dismiss`, { method: 'PATCH', headers: authHeaders });
         await fetchData();
     }
 

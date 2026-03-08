@@ -6,6 +6,7 @@
  */
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { BASE_URL } from '../lib/api';
 import { RiskScoreCard } from '../components/RiskScoreCard';
 import { InterventionTimeline } from '../components/InterventionTimeline';
 import type { RiskScoreCardProps } from '../components/RiskScoreCard';
@@ -51,8 +52,8 @@ export default function StudentRiskPage() {
     const fetchRisk = useCallback(async () => {
         try {
             const [rRes, iRes] = await Promise.all([
-                fetch('/api/risk/me', { headers }),
-                fetch('/api/interventions/mine', { headers }),
+                fetch(`${BASE_URL}/risk/me`, { headers }),
+                fetch(`${BASE_URL}/interventions/mine`, { headers }),
             ]);
             if (rRes.ok) {
                 const data = await rRes.json();
@@ -70,7 +71,7 @@ export default function StudentRiskPage() {
     async function handleCalculate() {
         setCalculating(true);
         try {
-            const res = await fetch('/api/risk/me/calculate', { method: 'POST', headers });
+            const res = await fetch(`${BASE_URL}/risk/me/calculate`, { method: 'POST', headers });
             const data = await res.json();
             setRisk(data);
         } finally {

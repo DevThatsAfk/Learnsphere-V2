@@ -7,6 +7,7 @@
  */
 import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { BASE_URL } from '../lib/api';
 import { RiskScoreCard } from '../components/RiskScoreCard';
 import { ChatWidget } from '../components/ChatWidget';
 import { InterventionTimeline } from '../components/InterventionTimeline';
@@ -69,7 +70,7 @@ export default function AdvisorPortal() {
 
     const selectStudent = useCallback(async (studentId: string) => {
         setSelectedId(studentId);
-        const res = await fetch(`/api/advisor/students/${studentId}`, { headers });
+        const res = await fetch(`${BASE_URL}/advisor/students/${studentId}`, { headers });
         if (res.ok) setDetail(await res.json());
     }, [token]);
 
@@ -148,9 +149,9 @@ export default function AdvisorPortal() {
                                         <div className="flex items-center justify-between mb-3">
                                             <p className="text-xs font-semibold text-slate-500 uppercase">Intervention #{i + 1}</p>
                                             <span className={`px-2 py-0.5 rounded-full text-xs font-semibold border ${iv.status === 'COMPLETED' ? 'bg-green-50 text-green-700 border-green-200' :
-                                                    iv.status === 'MODIFIED_SENT' ? 'bg-blue-50 text-blue-700 border-blue-200' :
-                                                        iv.status === 'ACKNOWLEDGED' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' :
-                                                            'bg-amber-50 text-amber-700 border-amber-200'
+                                                iv.status === 'MODIFIED_SENT' ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                                                    iv.status === 'ACKNOWLEDGED' ? 'bg-indigo-50 text-indigo-700 border-indigo-200' :
+                                                        'bg-amber-50 text-amber-700 border-amber-200'
                                                 }`}>{iv.status.replace('_', ' ')}</span>
                                         </div>
                                         {/* Timeline */}

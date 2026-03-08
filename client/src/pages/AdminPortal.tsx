@@ -4,6 +4,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { BASE_URL } from '../lib/api';
 
 interface User {
     id: string;
@@ -79,7 +80,7 @@ export default function AdminPortal() {
         const params = new URLSearchParams({ page: String(page) });
         if (search) params.set('search', search);
         if (roleFilter) params.set('role', roleFilter);
-        const r = await fetch(`/api/admin/users?${params}`, { headers: authH });
+        const r = await fetch(`${BASE_URL}/admin/users?${params}`, { headers: authH });
         if (r.ok) {
             const d = await r.json();
             setUsers(d.users ?? d);
@@ -94,7 +95,7 @@ export default function AdminPortal() {
     }, [token]);
 
     const fetchAudit = useCallback(async () => {
-        const r = await fetch(`/api/admin/audit-logs?page=${auditPage}`, { headers: authH });
+        const r = await fetch(`${BASE_URL}/admin/audit-logs?page=${auditPage}`, { headers: authH });
         if (r.ok) {
             const d = await r.json();
             setAuditLogs(d.logs ?? []);
@@ -129,7 +130,7 @@ export default function AdminPortal() {
 
     async function handleDeleteUser(id: string, email: string) {
         if (!confirm(`Delete ${email}?`)) return;
-        await fetch(`/api/admin/users/${id}`, { method: 'DELETE', headers: authH });
+        await fetch(`${BASE_URL}/admin/users/${id}`, { method: 'DELETE', headers: authH });
         fetchUsers();
     }
 
